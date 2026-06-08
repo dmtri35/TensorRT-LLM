@@ -526,6 +526,9 @@ public:
                 if (helix_is_inactive_rank.has_value())
                 {
                     mla_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
+                    // Speculative Helix verify passes one inactive flag per
+                    // query token; plain decode passes one flag per sequence.
+                    mla_params.helix_is_inactive_rank_per_token = (helix_is_inactive_rank->numel() == num_tokens);
                 }
             }
             else
@@ -564,6 +567,20 @@ public:
             mla_params.acc_q_len = num_tokens;
             mla_params.head_num = op.mNumHeads;
             mla_params.meta = op.mMLAParams;
+            if (helix_tensor_params.size() == 2)
+            {
+                auto const& helix_position_offsets = helix_tensor_params[0];
+                auto const& helix_is_inactive_rank = helix_tensor_params[1];
+                if (helix_position_offsets.has_value())
+                {
+                    mla_params.helix_position_offsets = helix_position_offsets->data_ptr<int32_t>();
+                }
+                if (helix_is_inactive_rank.has_value())
+                {
+                    mla_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
+                    mla_params.helix_is_inactive_rank_per_token = (helix_is_inactive_rank->numel() == num_tokens);
+                }
+            }
 
             mla_params.workspace = workspace_ptr;
         }

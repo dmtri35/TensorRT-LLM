@@ -295,6 +295,14 @@ def partition_context_for_helix(
     return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
 
 
+def _set_helix_request_state(req: LlmRequest, total_input_len: int, local_context_len: int) -> None:
+    req.total_input_len_cp = total_input_len
+    req.seqlen_this_rank_cp = local_context_len
+    req.py_helix_context_seqlen_cp = local_context_len
+    req.py_helix_local_past_seen = local_context_len
+    req.py_helix_global_decode_len = 0
+
+
 def merge_requests_to_llm_requests(
     new_requests: List, exclude_last_generation_logits: bool
 ) -> List[LlmRequest]:
@@ -355,8 +363,10 @@ def merge_helix_requests(
             input_token_ids=input_ids_this_rank,
             position_ids=position_ids_this_rank,
         )
-        req.total_input_len_cp = input_len
-        req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        local_context_len = len(input_ids_this_rank)
+        _set_helix_request_state(req, input_len, local_context_len)
+        for child_req in req.child_requests:
+            _set_helix_request_state(child_req, input_len, local_context_len)
         req_with_children.append(req)
         if req.child_requests:
             req_with_children.extend(req.child_requests)

@@ -1474,9 +1474,14 @@ class MTPForCausalLM(nn.Module):
 
         moe_load_balancer_set_repeated_for_next_layer(mtp_repeat_count)
 
+        mtp_kwargs = {}
+        if model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+            mtp_kwargs["mapping_with_cp"] = getattr(model, "mapping_with_cp",
+                                                    None)
+
         self.mtp_layers = nn.ModuleList([
             mtp_layer(model_config, layer_idx + start_layer_idx,
-                      model.aux_stream_dict)
+                      model.aux_stream_dict, **mtp_kwargs)
             for layer_idx in range(mtp_num_layers)
         ])
         self.lm_head = lm_head

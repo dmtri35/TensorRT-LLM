@@ -1593,9 +1593,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False):
+                 is_separate_draft_engine: bool = False,
+                 mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config, layer_idx, aux_stream_dict,
-                         is_separate_draft_engine)
+                         is_separate_draft_engine, mapping_with_cp)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
         self.moe_intermediate_size = config.moe_intermediate_size
@@ -1692,6 +1693,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
+        residual = maybe_slice_for_helix_cp(residual, attn_metadata,
+                                            self.mapping_with_cp,
+                                            self.layer_idx)
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1729,6 +1733,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             )
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
+
+        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
+                                                     attn_metadata,
+                                                     self.mapping_with_cp)
 
         # It's for 2-model path, capture the hidden states
         if spec_metadata is not None:

@@ -2282,6 +2282,37 @@ class PyTorchModelEngine(ModelEngine):
             return position_ids
         return [position_id + offset for position_id in position_ids]
 
+
+    def _helix_verify_token_params(self, request: LlmRequest, num_draft: int,
+                                   tokens_per_block: int):
+        """Compute per-query-token Helix parameters for a speculative verify forward.
+
+        MTP verifies ``[last accepted token] + [draft tokens]``. The last
+        accepted token has not gone through the target model yet, so the first
+        query is the unsettled decode token at index ``g`` and must be written by
+        its owning Helix rank.
+        """
+        cp_size = self.mapping.cp_size
+        cp_rank = self.mapping.cp_rank
+        global_decode_len = request.py_helix_global_decode_len
+        total_input_len = request.total_input_len_cp
+        first_decode_index = global_decode_len
+        first_position = total_input_len + first_decode_index
+        positions = list(range(first_position, first_position + 1 + num_draft))
+        inactive_flags = []
+        num_active = 0
+        for token_offset in range(1 + num_draft):
+            decode_index = first_decode_index + token_offset
+            owned = (decode_index // tokens_per_block) % cp_size == cp_rank
+            inactive_flags.append(not owned)
+            if owned:
+                num_active += 1
+        return positions, inactive_flags, num_active
+
+    def _should_build_helix_spec_decoding_mask(self) -> bool:
+        """Return whether Helix needs the packed custom mask metadata."""
+        return False
+
     def _prepare_encoder_decoder_cross_attention_inputs(
         self,
         encoder_hidden_states: List[torch.Tensor],
@@ -2466,7 +2497,11 @@ class PyTorchModelEngine(ModelEngine):
             total_num_tokens: int,
             num_generation_tokens: int,
             request_accepted_path: Optional[Dict[int, Any]] = None,
-            num_extend_ctx_requests: int = 0):
+            num_extend_ctx_requests: int = 0,
+            helix_position_offsets: Optional[List[int]] = None,
+            helix_is_inactive_rank: Optional[List[bool]] = None,
+            helix_zero_kv_mask: Optional[List[bool]] = None,
+            helix_total_input_len: Optional[List[int]] = None):
         """
         Common metadata preparation logic for incremental updates.
         """
@@ -2482,6 +2517,16 @@ class PyTorchModelEngine(ModelEngine):
             enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend) and spec_config.is_linear_tree) else 0
         attn_metadata.num_chunked_ctx_requests = attn_metadata.num_contexts
+
+        if self.mapping.has_cp_helix():
+            attn_metadata.update_helix_param(
+                helix_position_offsets=helix_position_offsets,
+                helix_is_inactive_rank=helix_is_inactive_rank,
+                helix_zero_kv_mask=helix_zero_kv_mask,
+                helix_total_input_len=helix_total_input_len,
+                build_spec_decoding_mask=(
+                    self._should_build_helix_spec_decoding_mask()),
+            )
 
         # Create KV cache params and prepare metadata
         attn_metadata.kv_cache_params = KVCacheParams(
@@ -2585,6 +2630,12 @@ class PyTorchModelEngine(ModelEngine):
         tokens_per_first_draft = self.original_max_draft_len + 1
         prompt_lengths = []  # per sequence
         num_cached_tokens_per_seq = []  # per sequence
+        helix_position_offsets, helix_is_inactive_rank = [], []
+        helix_zero_kv_mask, helix_total_input_len = [], []
+        has_cp_helix = self.mapping.has_cp_helix()
+        helix_tokens_per_block = (kv_cache_manager.tokens_per_block
+                                  if has_cp_helix
+                                  and kv_cache_manager is not None else None)
 
         for request in scheduled_requests.generation_requests:
             if request.is_dummy:
@@ -2594,6 +2645,19 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 assert request.py_is_first_draft
                 past_seen_token_num = request.max_beam_num_tokens - tokens_per_first_draft
+
+            if has_cp_helix:
+                num_draft_tokens = 0 if request.is_dummy else self.original_max_draft_len
+                positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                    request, num_draft_tokens, helix_tokens_per_block)
+                past_seen_token_num = request.py_helix_local_past_seen
+                helix_position_offsets.extend(positions_h)
+                helix_is_inactive_rank.extend(inactive_h)
+                helix_zero_kv_mask.extend(
+                    [past_seen_token_num + num_active_h == 0] *
+                    len(positions_h))
+                helix_total_input_len.append(request.total_input_len_cp)
+                request.cached_tokens = past_seen_token_num
 
             num_cached_tokens_per_seq.append(past_seen_token_num)
             prompt_lengths.append(request.py_prompt_len)
@@ -2627,7 +2691,11 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
             total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
-            num_extend_ctx_requests=0)
+            num_extend_ctx_requests=0,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=helix_is_inactive_rank,
+            helix_zero_kv_mask=helix_zero_kv_mask,
+            helix_total_input_len=helix_total_input_len)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
@@ -2743,6 +2811,12 @@ class PyTorchModelEngine(ModelEngine):
                                              dtype=torch.int,
                                              device='cpu',
                                              pin_memory=prefer_pinned())
+        helix_position_offsets, helix_is_inactive_rank = [], []
+        helix_zero_kv_mask, helix_total_input_len = [], []
+        has_cp_helix = self.mapping.has_cp_helix()
+        helix_tokens_per_block = (kv_cache_manager.tokens_per_block
+                                  if has_cp_helix
+                                  and kv_cache_manager is not None else None)
 
         request_accepted_path = {}
         num_extend_dummy_requests = 0
@@ -2757,6 +2831,17 @@ class PyTorchModelEngine(ModelEngine):
                 request.py_num_accepted_draft_tokens_indices
 
             base_past_seen = request.max_beam_num_tokens - 1
+            past_seen_token_num = base_past_seen
+            if has_cp_helix:
+                positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                    request, self.runtime_draft_len, helix_tokens_per_block)
+                past_seen_token_num = request.py_helix_local_past_seen
+                helix_position_offsets.extend(positions_h)
+                helix_is_inactive_rank.extend(inactive_h)
+                helix_zero_kv_mask.extend(
+                    [past_seen_token_num + num_active_h == 0] *
+                    len(positions_h))
+                helix_total_input_len.append(request.total_input_len_cp)
 
             if use_extend_ctx:
                 # We're treating the prompt lengths as context requests here, so
@@ -2766,8 +2851,8 @@ class PyTorchModelEngine(ModelEngine):
                 prompt_lengths[idx] = request.py_prompt_len
 
             if request.is_dummy:
-                num_cached_tokens_per_seq[idx] = base_past_seen
-                request.cached_tokens = base_past_seen
+                num_cached_tokens_per_seq[idx] = past_seen_token_num
+                request.cached_tokens = past_seen_token_num
                 num_extend_dummy_requests += 1
             else:
                 # Request has previous tensor
@@ -2775,8 +2860,10 @@ class PyTorchModelEngine(ModelEngine):
                     num_previous_batch] = request.py_batch_idx
                 num_previous_batch += 1
 
-                num_cached_tokens_per_seq[
-                    idx] = base_past_seen + num_tokens_per_extend_request
+                if not has_cp_helix:
+                    past_seen_token_num = (base_past_seen +
+                                           num_tokens_per_extend_request)
+                num_cached_tokens_per_seq[idx] = past_seen_token_num
                 request.cached_tokens = num_cached_tokens_per_seq[idx].item()
 
             request.py_batch_idx = request.py_seq_slot
@@ -2831,7 +2918,11 @@ class PyTorchModelEngine(ModelEngine):
             total_num_tokens=virtual_num_tokens,
             num_generation_tokens=num_generation_tokens,
             request_accepted_path=request_accepted_path,
-            num_extend_ctx_requests=num_extend_ctx_requests)
+            num_extend_ctx_requests=num_extend_ctx_requests,
+            helix_position_offsets=helix_position_offsets,
+            helix_is_inactive_rank=helix_is_inactive_rank,
+            helix_zero_kv_mask=helix_zero_kv_mask,
+            helix_total_input_len=helix_total_input_len)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
@@ -2979,6 +3070,14 @@ class PyTorchModelEngine(ModelEngine):
                 cross_encoder_seq_lens.append(0)
                 cross_encoder_cached_tokens_per_seq.append(encoder_output_len)
 
+        helix_is_inactive_rank, helix_position_offsets = [], []
+        helix_zero_kv_mask = []
+        helix_total_input_len = []
+        _has_cp_helix = self.mapping.has_cp_helix()
+        _helix_tokens_per_block = (kv_cache_manager.tokens_per_block
+                                   if _has_cp_helix
+                                   and kv_cache_manager is not None else None)
+
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
@@ -2986,8 +3085,18 @@ class PyTorchModelEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            position_ids.extend(
-                range(begin_compute, begin_compute + len(prompt_tokens)))
+            if _has_cp_helix and request.position_ids is not None:
+                ctx_position_ids = request.position_ids[begin_compute:
+                                                        end_compute]
+            else:
+                ctx_position_ids = list(
+                    range(begin_compute, begin_compute + len(prompt_tokens)))
+            position_ids.extend(ctx_position_ids)
+            if _has_cp_helix:
+                helix_position_offsets.extend(ctx_position_ids)
+                helix_is_inactive_rank.extend([False] * len(prompt_tokens))
+                helix_zero_kv_mask.extend([False] * len(prompt_tokens))
+                helix_total_input_len.append(request.total_input_len_cp)
 
             # Start offset of this request's (current-chunk) tokens within the
             # flattened input_ids. Recorded on multimodal_params below so models
@@ -3185,10 +3294,28 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + num_draft_tokens)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num,
-                              past_seen_token_num + 1 + num_draft_tokens)))
+                if _has_cp_helix:
+                    positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                        request, num_draft_tokens, _helix_tokens_per_block)
+                    past_seen_token_num = request.py_helix_local_past_seen
+                    position_ids.extend(positions_h)
+                    helix_position_offsets.extend(positions_h)
+                    helix_is_inactive_rank.extend(inactive_h)
+                    helix_zero_kv_mask.extend(
+                        [past_seen_token_num + num_active_h == 0] *
+                        len(positions_h))
+                    helix_total_input_len.append(request.total_input_len_cp)
+                elif not self.is_draft_model and not spec_config.is_linear_tree:
+                    assert spec_tree_manager is not None
+                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
+                    position_ids.extend(
+                        past_seen_token_num +
+                        spec_tree_manager.spec_dec_position_offsets[0])
+                else:
+                    position_ids.extend(
+                        list(
+                            range(past_seen_token_num,
+                                  past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 # update batch index
@@ -3208,17 +3335,38 @@ class PyTorchModelEngine(ModelEngine):
                     list(
                         range(len(position_ids),
                               len(position_ids) + 1 + self.runtime_draft_len)))
-                position_ids.extend(
-                    list(
-                        range(past_seen_token_num, past_seen_token_num + 1 +
-                              self.runtime_draft_len)))
+                if _has_cp_helix:
+                    positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                        request, self.runtime_draft_len,
+                        _helix_tokens_per_block)
+                    position_ids.extend(positions_h)
+                    helix_position_offsets.extend(positions_h)
+                    helix_is_inactive_rank.extend(inactive_h)
+                    helix_zero_kv_mask.extend(
+                        [request.py_helix_local_past_seen + num_active_h == 0] *
+                        len(positions_h))
+                    helix_total_input_len.append(request.total_input_len_cp)
+                elif not self.is_draft_model and not spec_config.is_linear_tree:
+                    assert spec_tree_manager is not None
+                    position_ids.extend(
+                        past_seen_token_num +
+                        spec_tree_manager.spec_dec_position_offsets[0])
+                else:
+                    position_ids.extend(
+                        list(
+                            range(past_seen_token_num, past_seen_token_num + 1 +
+                                  self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
                                             (1 + self.runtime_draft_len))
 
-                num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.runtime_draft_len + 1)
+                if _has_cp_helix:
+                    num_cached_tokens_per_seq.append(
+                        request.py_helix_local_past_seen)
+                else:
+                    num_cached_tokens_per_seq.append(past_seen_token_num +
+                                                     self.runtime_draft_len + 1)
                 request.cached_tokens = num_cached_tokens_per_seq[-1]
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
@@ -3236,8 +3384,17 @@ class PyTorchModelEngine(ModelEngine):
                 all_prompt_tokens) - self.original_max_draft_len - 1
             end_compute = begin_compute + self.original_max_draft_len + 1
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            position_ids.extend(
-                range(begin_compute, begin_compute + len(prompt_tokens)))
+            if _has_cp_helix:
+                positions_h, inactive_h, num_active_h = self._helix_verify_token_params(
+                    request, self.original_max_draft_len,
+                    _helix_tokens_per_block)
+                position_ids.extend(positions_h)
+                helix_position_offsets.extend(positions_h)
+                helix_is_inactive_rank.extend(inactive_h)
+                helix_total_input_len.append(request.total_input_len_cp)
+            else:
+                position_ids.extend(
+                    range(begin_compute, begin_compute + len(prompt_tokens)))
 
             # Track position for updating the inputs of draft model
             if self.is_draft_model and num_accepted_tokens_device is not None:
@@ -3275,16 +3432,18 @@ class PyTorchModelEngine(ModelEngine):
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
             prompt_lengths.append(request.py_prompt_len)
-            past_seen_token_num = begin_compute
+            past_seen_token_num = (request.py_helix_local_past_seen
+                                   if _has_cp_helix else begin_compute)
             num_cached_tokens_per_seq.append(past_seen_token_num)
+            if _has_cp_helix:
+                helix_zero_kv_mask.extend(
+                    [past_seen_token_num + num_active_h == 0] *
+                    len(positions_h))
             append_cross_attention_state(request, project_encoder_output=False)
 
             # update batch index
             request.py_batch_idx = request.py_seq_slot
 
-        helix_is_inactive_rank, helix_position_offsets = [], []
-        # Cache invariant method result to avoid repeated calls per-request
-        _has_cp_helix = self.mapping.has_cp_helix()
         _n_gen = len(generation_requests)
         if _n_gen > 0:
             # All generation requests have the same beam width
@@ -3333,18 +3492,17 @@ class PyTorchModelEngine(ModelEngine):
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    if request.py_helix_is_inactive_rank:
-                        past_seen_token_num = request.seqlen_this_rank_cp
-                    else:
-                        # Discount the token added to active rank in resource manager as it hasn't
-                        # been previously seen.
-                        past_seen_token_num = request.seqlen_this_rank_cp - 1
+                    past_seen_token_num = request.py_helix_local_past_seen
 
                     for beam in range(beam_width):
                         # Update helix-specific parameters.
                         helix_is_inactive_rank.append(
                             request.py_helix_is_inactive_rank)
                         helix_position_offsets.append(position_id)
+                        helix_zero_kv_mask.append(
+                            request.py_helix_is_inactive_rank
+                            and past_seen_token_num == 0)
+                        helix_total_input_len.append(request.total_input_len_cp)
 
                 request.cached_tokens = past_seen_token_num
                 for beam in range(beam_width):
@@ -3727,6 +3885,10 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
+                helix_zero_kv_mask=helix_zero_kv_mask,
+                helix_total_input_len=helix_total_input_len,
+                build_spec_decoding_mask=(
+                    self._should_build_helix_spec_decoding_mask()),
             )
 
         if not attn_metadata.is_cuda_graph:

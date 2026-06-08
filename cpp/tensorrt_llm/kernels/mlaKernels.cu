@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -360,6 +360,42 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* q_pe, T* k
     }
 }
 
+__device__ __forceinline__ int helixKvWriteSlot(bool const* helix_is_inactive_rank,
+    bool helix_is_inactive_rank_per_token, int global_token_idx, int batch_idx, int local_token_idx, int seq_len,
+    int kv_cache_len)
+{
+    if (helix_is_inactive_rank == nullptr)
+    {
+        return kv_cache_len - seq_len + local_token_idx;
+    }
+
+    if (!helix_is_inactive_rank_per_token)
+    {
+        return helix_is_inactive_rank[batch_idx] ? -1 : kv_cache_len - seq_len + local_token_idx;
+    }
+
+    if (helix_is_inactive_rank[global_token_idx])
+    {
+        return -1;
+    }
+
+    // Per-token Helix flags are packed sequence-major with the uniform
+    // generation seq_len enforced by invokeMLARopeGeneration.
+    int owned_token_count = 0;
+    int owned_token_idx = 0;
+    int const seq_start = batch_idx * seq_len;
+    for (int idx = 0; idx < seq_len; ++idx)
+    {
+        bool const owned = !helix_is_inactive_rank[seq_start + idx];
+        owned_token_count += owned ? 1 : 0;
+        if (idx < local_token_idx)
+        {
+            owned_token_idx += owned ? 1 : 0;
+        }
+    }
+    return kv_cache_len - owned_token_count + owned_token_idx;
+}
+
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe, T const* fuse_buf, void* quant_q,
     KVCacheBuffer kv_cache, float2 const* cos_sin_cache, size_t head_num, int c_k, int total_s_len, int seq_len,
@@ -367,7 +403,7 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
     int q_pe_stride, KvCacheDataType cache_type, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
     float const* quant_scale_q, float const* quant_scale_kv, float const* dequant_scale_q,
     float const* dequant_scale_kv, float host_bmm1_scale, int32_t const* helix_position_offsets,
-    bool const* helix_is_inactive_rank)
+    bool const* helix_is_inactive_rank, bool helix_is_inactive_rank_per_token)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
@@ -477,10 +513,11 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             {
                 if (head_idx == head_num)
                 {
-                    // If helix parallelism is being used, only write to KV cache if current rank is active.
-                    if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                    auto const token_kv_idx = helixKvWriteSlot(helix_is_inactive_rank,
+                        helix_is_inactive_rank_per_token, global_token_idx, batch_idx, local_token_idx, seq_len,
+                        kv_cache_lengths[batch_idx]);
+                    if (token_kv_idx >= 0)
                     {
-                        auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
 
                         {
                             auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
@@ -540,10 +577,10 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
                     seqQOffset[batch_idx + 1] = head_num * seq_len * (batch_idx + 1);
                 }
 
-                // If helix parallelism is being used, only write to KV cache if current rank is active.
-                if (helix_is_inactive_rank == nullptr || !helix_is_inactive_rank[batch_idx])
+                auto const token_kv_idx = helixKvWriteSlot(helix_is_inactive_rank, helix_is_inactive_rank_per_token,
+                    global_token_idx, batch_idx, local_token_idx, seq_len, kv_cache_lengths[batch_idx]);
+                if (token_kv_idx >= 0)
                 {
-                    auto const token_kv_idx = kv_cache_lengths[batch_idx] - seq_len + local_token_idx;
                     auto const src_kv_global_offset = static_cast<size_t>(global_token_idx) * (c_k + ROPE_DIM);
 
                     {
@@ -1110,7 +1147,8 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
         params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
         params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
         params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
-        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank);
+        params.host_bmm1_scale, params.helix_position_offsets, params.helix_is_inactive_rank,
+        params.helix_is_inactive_rank_per_token);
 }
 
 template <typename T, typename TCache>

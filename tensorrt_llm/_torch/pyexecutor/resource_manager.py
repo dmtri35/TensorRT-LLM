@@ -105,6 +105,49 @@ def compute_page_count(token_count: int, tokens_per_page: int) -> int:
     return (token_count + tokens_per_page) // tokens_per_page
 
 
+def _helix_owned_decode_prefix_count(num_decode_tokens: int,
+                                     tokens_per_block: int, cp_size: int,
+                                     cp_rank: int) -> int:
+    """Count owned decode indices in [0, num_decode_tokens)."""
+    if num_decode_tokens <= 0:
+        return 0
+
+    cycle_tokens = tokens_per_block * cp_size
+    full_cycles, remainder = divmod(num_decode_tokens, cycle_tokens)
+    rank_start = cp_rank * tokens_per_block
+    remainder_owned = min(max(remainder - rank_start, 0), tokens_per_block)
+    return full_cycles * tokens_per_block + remainder_owned
+
+
+def _helix_count_owned_decode_indices(start_index: int, count: int,
+                                      tokens_per_block: int, cp_size: int,
+                                      cp_rank: int) -> int:
+    """Count owned decode indices in [start_index, start_index + count)."""
+    if count <= 0:
+        return 0
+    end_index = start_index + count
+    return _helix_owned_decode_prefix_count(
+        end_index, tokens_per_block, cp_size,
+        cp_rank) - _helix_owned_decode_prefix_count(start_index,
+                                                    tokens_per_block, cp_size,
+                                                    cp_rank)
+
+
+def _helix_spec_overlap_reserve(draft_len: int, max_draft_len: int) -> int:
+    """Reserve enough decode positions for the shifted overlap window."""
+    reserve = max(draft_len, max_draft_len)
+    if reserve == 0:
+        return 0
+    return 2 * reserve + 1
+
+
+def _helix_owns_decode_index(decode_index: int, tokens_per_block: int,
+                             cp_size: int, cp_rank: int) -> bool:
+    if decode_index < 0:
+        return False
+    return (decode_index // tokens_per_block) % cp_size == cp_rank
+
+
 def _warn_if_unsupported_v1_kv_cache_event_hash_algo(hash_algo: str) -> None:
     if hash_algo in (KV_CACHE_HASH_ALGO_AUTO, KV_CACHE_HASH_ALGO_V1):
         return
@@ -723,6 +766,63 @@ class KVCacheManager(BaseResourceManager):
             return None
         return req.prompt_len
 
+
+    def _helix_owns_decode_index(self, decode_index: int) -> bool:
+        return _helix_owns_decode_index(decode_index, self.tokens_per_block,
+                                        self.mapping.cp_size,
+                                        self.mapping.cp_rank)
+
+    def _helix_count_owned(self, start_index: int, count: int) -> int:
+        return _helix_count_owned_decode_indices(start_index, count,
+                                                self.tokens_per_block,
+                                                self.mapping.cp_size,
+                                                self.mapping.cp_rank)
+
+    def _helix_owned_decode_count(self, num_decode_tokens: int) -> int:
+        return _helix_owned_decode_prefix_count(num_decode_tokens,
+                                               self.tokens_per_block,
+                                               self.mapping.cp_size,
+                                               self.mapping.cp_rank)
+
+    def _helix_rank_kv_len(self, req: LlmRequest,
+                           global_decode_len: int) -> int:
+        return (req.py_helix_context_seqlen_cp +
+                self._helix_owned_decode_count(global_decode_len))
+
+    def _helix_prepare_generation_kv(self, req: LlmRequest,
+                                     draft_len: int) -> None:
+        global_decode_len = req.py_helix_global_decode_len
+        req.py_helix_local_past_seen = self._helix_rank_kv_len(
+            req, global_decode_len)
+
+        reserve = _helix_spec_overlap_reserve(
+            draft_len, self._kv_reserve_draft_tokens)
+        for offset in range(1 + reserve):
+            if self._helix_owns_decode_index(global_decode_len + offset):
+                self.impl.add_token(req.py_request_id)
+
+        req.py_helix_is_inactive_rank = not self._helix_owns_decode_index(
+            global_decode_len)
+
+    def _helix_rewind_generation_kv(self, req: LlmRequest) -> None:
+        global_decode_len = req.py_helix_global_decode_len
+        accepted = req.py_num_accepted_draft_tokens
+        runtime_draft_len = req.py_rewind_len + accepted
+        reserve = _helix_spec_overlap_reserve(
+            runtime_draft_len, self._kv_reserve_draft_tokens)
+
+        rewind_count = reserve - accepted
+        if rewind_count > 0:
+            owned_rewind = self._helix_count_owned(
+                global_decode_len + 1 + accepted, rewind_count)
+            if owned_rewind > 0:
+                self.rewind_kv_cache(req, owned_rewind)
+
+        req.py_helix_global_decode_len = global_decode_len + 1 + accepted
+        req.seqlen_this_rank_cp = self._helix_rank_kv_len(
+            req, req.py_helix_global_decode_len)
+        req.py_helix_local_past_seen = req.seqlen_this_rank_cp
+
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # Cross/encoder K/V is allocated once and never grows; handle it on a
         # dedicated path so the self-attention flow below stays unconditional.
@@ -758,16 +858,9 @@ class KVCacheManager(BaseResourceManager):
 
             for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
-                    # Distribute the decode blocks across CP ranks in a round-robin manner.
-                    decode_block_id = (req.py_decoding_iter -
-                                       1) // self.tokens_per_block
-                    if decode_block_id % self.mapping.cp_size == self.mapping.cp_rank:
-                        req.py_helix_is_inactive_rank = False
-                        req.seqlen_this_rank_cp += 1
-                    else:
-                        req.py_helix_is_inactive_rank = True
-                        # Skip allocating KV cache at decode for inactive helix ranks.
-                        continue
+                    self._helix_prepare_generation_kv(
+                        req, get_draft_token_length(req))
+                    continue
                 draft_len = get_draft_token_length(req)
                 self.impl.add_token(req.py_request_id)
                 for _ in range(max(draft_len, self._kv_reserve_draft_tokens)):
@@ -951,6 +1044,9 @@ class KVCacheManager(BaseResourceManager):
                         req.seqlen_this_rank_cp = req.prompt_len
                         req.total_input_len_cp = token_num * self.mapping.cp_size - 1
                         req.py_decoding_iter = 1
+                    req.py_helix_global_decode_len = req.py_decoding_iter
+                    req.py_helix_context_seqlen_cp = req.seqlen_this_rank_cp
+                    req.py_helix_local_past_seen = req.seqlen_this_rank_cp
                 req.py_draft_tokens = [1] * max_num_draft_tokens
                 if prepare_resource:
                     for _ in range(_kv_draft):
@@ -987,6 +1083,9 @@ class KVCacheManager(BaseResourceManager):
             for request in scheduled_batch.generation_requests:
                 if request.state in (LlmRequestState.GENERATION_COMPLETE,
                                      LlmRequestState.CONTEXT_INIT):
+                    continue
+                if self.mapping.has_cp_helix():
+                    self._helix_rewind_generation_kv(request)
                     continue
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)

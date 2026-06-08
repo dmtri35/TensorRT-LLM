@@ -117,6 +117,10 @@ struct MlaParams
     // for Helix parallelism: whether the current rank is inactive, shape [b]
     // (the current query tokens are not appended to this rank's KV cache)
     bool const* helix_is_inactive_rank{nullptr};
+
+    // for Helix speculative decoding: inactive flags are per query token rather
+    // than per sequence.
+    bool helix_is_inactive_rank_per_token{false};
 };
 
 template <typename T, typename KVCacheBuffer>

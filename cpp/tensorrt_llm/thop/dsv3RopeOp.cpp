@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -71,6 +71,7 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
+    bool helix_is_inactive_rank_per_token;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -111,6 +112,7 @@ void invokeMLARopeGenerationHelper(T const* latent_cache_ptr, T* q_pe_ptr, T* fu
     mla_params.host_bmm1_scale = args.host_bmm1_scale;
     mla_params.helix_position_offsets = args.helix_position_offsets_ptr;
     mla_params.helix_is_inactive_rank = args.helix_is_inactive_rank_ptr;
+    mla_params.helix_is_inactive_rank_per_token = args.helix_is_inactive_rank_per_token;
 
     tk::invokeMLARopeGeneration<T>(mla_params, kv_cache_buffer, stream);
 }
@@ -166,6 +168,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         = helix_position_offsets.has_value() ? helix_position_offsets->data_ptr<int32_t>() : nullptr;
     bool const* helix_is_inactive_rank_ptr
         = helix_is_inactive_rank.has_value() ? helix_is_inactive_rank->data_ptr<bool>() : nullptr;
+    bool const helix_is_inactive_rank_per_token
+        = helix_is_inactive_rank.has_value() && helix_is_inactive_rank->numel() == num_tokens;
 
     int* cu_q_seqlens_ptr = reinterpret_cast<int*>(cu_q_seqlens.data_ptr());
     int* cu_kv_seqlens_ptr = reinterpret_cast<int*>(cu_kv_seqlens.data_ptr());
@@ -230,7 +234,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, max_context_q_len,
         block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
         mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr, kv_scale_orig_quant_ptr,
-        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr};
+        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr,
+        helix_is_inactive_rank_per_token};
 
     auto const input_dtype = fused_q.scalar_type();
     if (input_dtype == torch::kFloat16)
