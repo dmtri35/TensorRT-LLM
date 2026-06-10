@@ -16,7 +16,9 @@
 import torch
 
 from tensorrt_llm._torch.attention_backend.trtllm import (
-    _build_helix_spec_decoding_packed_mask, )
+    _build_helix_spec_decoding_packed_mask,
+    _build_helix_spec_decoding_position_offsets,
+)
 
 
 def _unpack_row(row: torch.Tensor, width: int) -> list[int]:
@@ -51,3 +53,16 @@ def test_helix_spec_decoding_mask_uses_owned_suffix_order():
     assert _unpack_row(packed_mask[1, 1], 4) == [0]
     assert _unpack_row(packed_mask[1, 2], 4) == [0]
     assert _unpack_row(packed_mask[1, 3], 4) == [0, 1]
+
+
+def test_helix_spec_decoding_position_offsets_are_materialized():
+    position_offsets = _build_helix_spec_decoding_position_offsets(
+        num_seqs=3, max_generation_length=4)
+
+    assert position_offsets.tolist() == [
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+        [0, 1, 2, 3],
+    ]
+    assert position_offsets.is_contiguous()
+    assert position_offsets.stride(0) == 4
