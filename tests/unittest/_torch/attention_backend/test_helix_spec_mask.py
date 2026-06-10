@@ -15,9 +15,11 @@
 
 import torch
 
+from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
 from tensorrt_llm._torch.attention_backend.trtllm import (
     _build_helix_spec_decoding_packed_mask,
     _build_helix_spec_decoding_position_offsets,
+    _should_use_helix_spec_decoding_mask,
 )
 
 
@@ -66,3 +68,12 @@ def test_helix_spec_decoding_position_offsets_are_materialized():
     ]
     assert position_offsets.is_contiguous()
     assert position_offsets.stride(0) == 4
+
+
+def test_helix_spec_decoding_mask_is_disabled_for_mla():
+    assert not _should_use_helix_spec_decoding_mask(
+        is_mla_enable=True,
+        attention_input_type=AttentionInputType.generation_only,
+        mask_ready=True,
+        sm=100,
+    )
