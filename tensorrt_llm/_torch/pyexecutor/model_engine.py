@@ -4029,6 +4029,15 @@ class PyTorchModelEngine(ModelEngine):
                     draft_request_indices_buffer_cuda[:
                                                       num_first_draft]] += accepted_tokens
 
+        if not attn_metadata.is_cuda_graph:
+            # Assumes seq lens do not change between CUDA graph invocations. This applies
+            # to draft sequences too. This means that all draft sequences must be padded.
+            attn_metadata.seq_lens = torch.tensor(
+                sequence_lengths,
+                dtype=torch.int,
+                pin_memory=prefer_pinned(),
+            )
+
         if self.mapping.has_cp_helix():
             attn_metadata.update_helix_param(
                 helix_position_offsets=helix_position_offsets,
@@ -4037,15 +4046,6 @@ class PyTorchModelEngine(ModelEngine):
                 helix_total_input_len=helix_total_input_len,
                 build_spec_decoding_mask=(
                     self._should_build_helix_spec_decoding_mask()),
-            )
-
-        if not attn_metadata.is_cuda_graph:
-            # Assumes seq lens do not change between CUDA graph invocations. This applies
-            # to draft sequences too. This means that all draft sequences must be padded.
-            attn_metadata.seq_lens = torch.tensor(
-                sequence_lengths,
-                dtype=torch.int,
-                pin_memory=prefer_pinned(),
             )
 
         num_generation_requests = len(gen_request_seq_slots)

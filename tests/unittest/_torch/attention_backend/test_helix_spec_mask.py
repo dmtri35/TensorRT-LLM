@@ -20,6 +20,7 @@ from tensorrt_llm._torch.attention_backend.trtllm import (
     _build_helix_spec_decoding_packed_mask,
     _build_helix_spec_decoding_position_offsets,
     _should_use_helix_spec_decoding_mask,
+    _should_use_helix_owned_token_counts,
 )
 
 
@@ -100,4 +101,19 @@ def test_helix_spec_decoding_mask_metadata_is_enabled_for_mla_microstep(
         attention_input_type=AttentionInputType.context_only,
         mask_ready=True,
         sm=100,
+    )
+
+
+def test_helix_owned_token_counts_use_microstep_mask_readiness():
+    assert _should_use_helix_owned_token_counts(
+        is_spec_decoding_enabled=True,
+        helix_spec_decoding_mask_ready=False,
+    )
+    assert _should_use_helix_owned_token_counts(
+        is_spec_decoding_enabled=False,
+        helix_spec_decoding_mask_ready=True,
+    )
+    assert not _should_use_helix_owned_token_counts(
+        is_spec_decoding_enabled=False,
+        helix_spec_decoding_mask_ready=False,
     )
