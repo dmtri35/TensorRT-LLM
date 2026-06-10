@@ -110,6 +110,8 @@ std::string const& getEnvKVCacheTimeOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
+bool getEnvHelixMlaMtpMicrostep();
+
 // Force deterministic behavior for all kernels.
 bool getEnvForceDeterministic();
 

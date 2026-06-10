@@ -25,6 +25,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/helixMlaMicrostepKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -44,6 +45,23 @@ using tensorrt_llm::common::op::AttentionOp;
 using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::AttentionXqaWorkspaceSizes;
 using tensorrt_llm::common::op::KvCacheBuffers;
+
+namespace
+{
+
+size_t getHelixMlaMicrostepWorkspaceSize(size_t const qElemSize, size_t const oElemSize, int32_t const batchSize,
+    int32_t const numHeads, int32_t const headDimQk, int32_t const headDimV)
+{
+    int const kNumBuffers = 4;
+    size_t workspaces[kNumBuffers];
+    workspaces[0] = qElemSize * batchSize * numHeads * headDimQk;
+    workspaces[1] = oElemSize * batchSize * numHeads * headDimV;
+    workspaces[2] = sizeof(float2) * batchSize * numHeads;
+    workspaces[3] = sizeof(int32_t) * batchSize;
+    return tc::calculateTotalWorkspaceSize(workspaces, kNumBuffers);
+}
+
+} // namespace
 
 template <typename T>
 struct SATypeConverter
@@ -944,13 +962,20 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         size_t const fmha_scheduler_counter = sizeof(uint32_t);
         size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
 
-        int const NUM_BUFFERS = 5;
+        int32_t const headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+
+        int const NUM_BUFFERS = 6;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_q_len
         workspaces[1] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_kv_len
         workspaces[2] = mIsGenerationMLA ? 0 : fmha_scheduler_counter;
         workspaces[3] = fmha_multi_ctas_kv_scratch_size;
-        workspaces[4] = flash_mla_workspace_size;
+        workspaces[4] = tc::getEnvHelixMlaMtpMicrostep()
+            ? getHelixMlaMicrostepWorkspaceSize(
+                mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : size, size, batch_beam, mNumAttnHeads, headDim,
+                mMLAParams.kv_lora_rank)
+            : 0;
+        workspaces[5] = flash_mla_workspace_size;
 
         fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
@@ -1053,7 +1078,9 @@ int AttentionOp::mlaGeneration(
     // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
     auto kv_scale_cache_buffer = KVBlockArray();
 
-    void* scratchPtr = params.workspace;
+    // Workspace pointer shift
+    int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
+    size_t offset = 0;
 
     params.quant_scale_o = generation_params.attention_output_orig_quant;
     params.quant_scale_q = generation_params.kv_scale_orig_quant;
@@ -1079,6 +1106,7 @@ int AttentionOp::mlaGeneration(
     if (mUseTllmGen)
     {
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
+        void* scratchPtr = nextWorkspacePtr(workspace_byte_ptr, offset, getFmhaMultiCtasKvScratchSize());
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
@@ -1194,7 +1222,65 @@ int AttentionOp::mlaGeneration(
             }
         }
 
-        mTllmGenFMHARunner->run(tllmRunnerParams);
+        bool const useHelixMlaMtpMicrostep = tc::getEnvHelixMlaMtpMicrostep() && mCpSize > 1
+            && mIsSpecDecodingEnabled && mUseSpecDecoding && tllmRunnerParams.mMaxSeqLenQ > 1
+            && params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank_per_token;
+        if (useHelixMlaMtpMicrostep)
+        {
+            // TRTLLM-Gen has no Custom-mask MLA cubin for DeepSeek shapes. For
+            // each verify offset, causal Q=1 attention over a truncated local KV
+            // prefix is equivalent to the Helix custom mask row for that token.
+            TLLM_CHECK_WITH_INFO(!useSparseMLA(), "Helix MLA MTP microstep is not supported with sparse MLA.");
+            TLLM_CHECK_WITH_INFO(generation_params.context_buf_sf == nullptr,
+                "Helix MLA MTP microstep does not support NVFP4 attention output.");
+            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_packed_mask != nullptr,
+                "Helix MLA MTP microstep requires spec_decoding_packed_mask.");
+            TLLM_CHECK_WITH_INFO(generation_params.spec_bl_tree_first_sparse_mask_offset_kv != nullptr,
+                "Helix MLA MTP microstep requires spec_bl_tree_first_sparse_mask_offset_kv.");
+            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_max_generation_length >= tllmRunnerParams.mMaxSeqLenQ,
+                "Helix MLA MTP microstep metadata is shorter than the query sequence.");
+            TLLM_CHECK_WITH_INFO(generation_params.softmax_stats != nullptr,
+                "Helix MLA MTP microstep requires softmax stats for Helix reduction.");
+
+            int32_t const seqLenQ = tllmRunnerParams.mMaxSeqLenQ;
+            int32_t const packedMaskSeqStride = generation_params.spec_decoding_max_generation_length;
+            int32_t const packedMaskBlockStride = tc::divUp(packedMaskSeqStride, 32);
+            int32_t const validMaskBlocks = tc::divUp(seqLenQ, 32);
+            auto const qElemSize = mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : sizeof(T);
+            size_t const qRowBytes = qElemSize * tllmRunnerParams.mNumHeadsQ * tllmRunnerParams.mHeadDimQk;
+            size_t const oRowBytes = sizeof(T) * tllmRunnerParams.mNumHeadsQ * tllmRunnerParams.mHeadDimV;
+            void* qStepPtr = nextWorkspacePtr(workspace_byte_ptr, offset, batch_beam * qRowBytes);
+            void* oStepPtr = nextWorkspacePtr(workspace_byte_ptr, offset, batch_beam * oRowBytes);
+            float2* softmaxStatsStepPtr = reinterpret_cast<float2*>(nextWorkspacePtr(
+                workspace_byte_ptr, offset, sizeof(float2) * batch_beam * tllmRunnerParams.mNumHeadsQ));
+            int32_t* stepKvLensPtr = reinterpret_cast<int32_t*>(
+                nextWorkspacePtr(workspace_byte_ptr, offset, sizeof(int32_t) * batch_beam));
+
+            TllmGenFmhaRunnerParams stepRunnerParams = tllmRunnerParams;
+            stepRunnerParams.qPtr = qStepPtr;
+            stepRunnerParams.oPtr = oStepPtr;
+            stepRunnerParams.oSfPtr = nullptr;
+            stepRunnerParams.softmaxStatsPtr = softmaxStatsStepPtr;
+            stepRunnerParams.seqLensKvPtr = stepKvLensPtr;
+            stepRunnerParams.mMaxSeqLenQ = 1;
+            stepRunnerParams.mSumOfSeqLensQ = batch_beam;
+
+            for (int32_t step = 0; step < seqLenQ; ++step)
+            {
+                invokePrepareHelixMlaMicrostep(tllmRunnerParams.qPtr, qStepPtr,
+                    generation_params.spec_bl_tree_first_sparse_mask_offset_kv,
+                    generation_params.spec_decoding_packed_mask, stepKvLensPtr, batch_beam, seqLenQ,
+                    packedMaskSeqStride, packedMaskBlockStride, validMaskBlocks, step, qRowBytes, stream);
+                mTllmGenFMHARunner->run(stepRunnerParams);
+                invokeScatterHelixMlaMicrostep(oStepPtr, tllmRunnerParams.oPtr, softmaxStatsStepPtr,
+                    tllmRunnerParams.softmaxStatsPtr, batch_beam, seqLenQ, step, oRowBytes, tllmRunnerParams.mNumHeadsQ,
+                    stream);
+            }
+        }
+        else
+        {
+            mTllmGenFMHARunner->run(tllmRunnerParams);
+        }
         sync_check_cuda_error(stream);
     }
     else if (mUseGenFlashMLA)

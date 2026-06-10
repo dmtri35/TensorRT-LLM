@@ -77,3 +77,27 @@ def test_helix_spec_decoding_mask_is_disabled_for_mla():
         mask_ready=True,
         sm=100,
     )
+
+
+def test_helix_spec_decoding_mask_metadata_is_enabled_for_mla_microstep(
+        monkeypatch):
+    monkeypatch.setenv("TRTLLM_HELIX_MLA_MTP_MICROSTEP", "1")
+
+    assert _should_use_helix_spec_decoding_mask(
+        is_mla_enable=True,
+        attention_input_type=AttentionInputType.generation_only,
+        mask_ready=True,
+        sm=100,
+    )
+    assert not _should_use_helix_spec_decoding_mask(
+        is_mla_enable=True,
+        attention_input_type=AttentionInputType.generation_only,
+        mask_ready=False,
+        sm=100,
+    )
+    assert not _should_use_helix_spec_decoding_mask(
+        is_mla_enable=True,
+        attention_input_type=AttentionInputType.context_only,
+        mask_ready=True,
+        sm=100,
+    )
