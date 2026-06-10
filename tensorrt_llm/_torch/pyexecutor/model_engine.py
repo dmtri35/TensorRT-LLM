@@ -82,13 +82,6 @@ from .resource_manager import (BaseResourceManager, KVCacheManager,
 from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
-
-def _maybe_helix_cp_shard_count(mapping: Mapping, num_tokens: int) -> int:
-    if mapping.has_cp_helix():
-        return math.ceil(num_tokens / mapping.cp_size)
-    return num_tokens
-
-
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -225,6 +218,13 @@ def _filter_cuda_graph_seq_lens(cuda_graph_seq_lens: list[int],
                 result.append(max_seq_len)
             break
     return result
+
+
+def _get_num_tokens_after_helix_cp(num_tokens: int, mapping: Mapping) -> int:
+    """Return the token rows visible to MoE after Helix CP reduce-scatter."""
+    if mapping.has_cp_helix():
+        return math.ceil(num_tokens / mapping.cp_size)
+    return num_tokens
 
 
 class PyTorchModelEngine(ModelEngine):
@@ -2085,17 +2085,29 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
+                previous_pos_id_offsets = self.previous_pos_id_offsets_cuda[:
+                                                                            previous_batch_tokens]
+                helix_previous_batch_tokens = self._get_helix_overlap_num_tokens(
+                    inputs['attn_metadata'], num_ctx_tokens,
+                    previous_batch_tokens)
                 if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
                     inputs['position_ids'][:, :, num_ctx_tokens:] += (
-                        self.
-                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                        previous_pos_id_offsets)
                 else:
                     inputs['position_ids'][0, num_ctx_tokens:] += (
-                        self.
-                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
-
+                        previous_pos_id_offsets)
+                helix_kv_lens_delta = self._update_helix_overlap_params(
+                    inputs['attn_metadata'],
+                    num_ctx_requests,
+                    num_ctx_tokens,
+                    helix_previous_batch_tokens,
+                    previous_pos_id_offsets[:helix_previous_batch_tokens],
+                    restore=False)
                 if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
-                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
+                    if helix_kv_lens_delta is not None:
+                        inputs['attn_metadata'].kv_lens_cuda[
+                            num_ctx_requests:num_seqs] += helix_kv_lens_delta
+                    elif num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -
@@ -2133,18 +2145,29 @@ class PyTorchModelEngine(ModelEngine):
                     'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
+                previous_pos_id_offsets = self.previous_pos_id_offsets_cuda[:
+                                                                            previous_batch_tokens]
+                helix_previous_batch_tokens = self._get_helix_overlap_num_tokens(
+                    inputs['attn_metadata'], num_ctx_tokens,
+                    previous_batch_tokens)
                 if inputs['position_ids'].ndim == 3:  # mrope: [3, 1, N]
                     inputs['position_ids'][:, :, num_ctx_tokens:] -= (
-                        self.
-                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                        previous_pos_id_offsets)
                 else:
                     inputs['position_ids'][0, num_ctx_tokens:] -= (
-                        self.
-                        previous_pos_id_offsets_cuda[:previous_batch_tokens])
-
-                # Only TrtllmAttentionMetadata has kv_lens_cuda.
-                if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
-                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
+                        previous_pos_id_offsets)
+                helix_kv_lens_delta = self._update_helix_overlap_params(
+                    inputs['attn_metadata'],
+                    num_ctx_requests,
+                    num_ctx_tokens,
+                    helix_previous_batch_tokens,
+                    previous_pos_id_offsets[:helix_previous_batch_tokens],
+                    restore=True)
+                if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
+                    if helix_kv_lens_delta is not None:
+                        inputs['attn_metadata'].kv_lens_cuda[
+                            num_ctx_requests:num_seqs] += helix_kv_lens_delta
+                    elif num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
                         inputs['attn_metadata'].kv_lens_cuda[
                             num_ctx_requests -
                             num_chunked_ctx_requests:num_ctx_requests] -= (
@@ -2159,6 +2182,102 @@ class PyTorchModelEngine(ModelEngine):
                                 previous_kv_lens_offsets_cuda[:num_gen_requests]
                             )
 
+    def _get_helix_overlap_num_tokens(self, attn_metadata: AttentionMetadata,
+                                      num_ctx_tokens: int,
+                                      previous_batch_tokens: int) -> int:
+        if not self.mapping.has_cp_helix():
+            return previous_batch_tokens
+        num_tokens = getattr(attn_metadata, 'num_tokens', None)
+        if num_tokens is None:
+            return previous_batch_tokens
+        return max(0, min(previous_batch_tokens, num_tokens - num_ctx_tokens))
+
+    def _update_helix_overlap_params(self, attn_metadata: AttentionMetadata,
+                                     num_ctx_requests: int,
+                                     num_ctx_tokens: int,
+                                     previous_batch_tokens: int,
+                                     position_offsets: torch.Tensor,
+                                     restore: bool) -> Optional[torch.Tensor]:
+        if (not self.mapping.has_cp_helix() or previous_batch_tokens == 0
+                or getattr(attn_metadata, 'helix_position_offsets', None)
+                is None
+                or getattr(attn_metadata, 'helix_is_inactive_rank', None)
+                is None
+                or getattr(attn_metadata, 'helix_total_input_len', None) is None
+                or getattr(attn_metadata, 'seq_lens_cuda', None) is None
+                or getattr(attn_metadata, 'tokens_per_block', None) is None):
+            helix_position_offsets = getattr(attn_metadata,
+                                             'helix_position_offsets', None)
+            if helix_position_offsets is not None:
+                start = num_ctx_tokens
+                end = start + previous_batch_tokens
+                if restore:
+                    helix_position_offsets[start:end] -= position_offsets
+                else:
+                    helix_position_offsets[start:end] += position_offsets
+            return None
+
+        device = attn_metadata.helix_position_offsets.device
+        position_offsets = position_offsets.to(device=device, dtype=torch.int64)
+        token_start = num_ctx_tokens
+        token_end = token_start + previous_batch_tokens
+        current_positions = attn_metadata.helix_position_offsets[
+            token_start:token_end].to(torch.int64)
+        old_positions = (current_positions - position_offsets
+                         if restore else current_positions)
+        new_positions = old_positions + position_offsets
+
+        seq_lens = attn_metadata.seq_lens_cuda[
+            num_ctx_requests:attn_metadata.num_seqs].to(device=device,
+                                                        dtype=torch.long)
+        num_gen_requests = attn_metadata.num_seqs - num_ctx_requests
+        seq_ids_local = torch.repeat_interleave(
+            torch.arange(num_gen_requests, device=device, dtype=torch.long),
+            seq_lens,
+            output_size=previous_batch_tokens)
+        seq_ids = seq_ids_local + num_ctx_requests
+        seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+        local_token_idx = torch.arange(
+            previous_batch_tokens, device=device,
+            dtype=torch.long) - seq_starts[seq_ids_local]
+
+        total_input_len = attn_metadata.helix_total_input_len[
+            seq_ids].to(device=device, dtype=torch.int64)
+        tokens_per_block = attn_metadata.tokens_per_block
+        old_decode_index = old_positions - total_input_len
+        new_decode_index = new_positions - total_input_len
+        old_owner = ((old_decode_index // tokens_per_block) %
+                     self.mapping.cp_size) == self.mapping.cp_rank
+        new_owner = ((new_decode_index // tokens_per_block) %
+                     self.mapping.cp_size) == self.mapping.cp_rank
+
+        accepted_owner = old_owner & (local_token_idx < position_offsets)
+        old_owned_counts = torch.zeros(num_gen_requests,
+                                       dtype=torch.int32,
+                                       device=device)
+        new_owned_counts = torch.zeros_like(old_owned_counts)
+        accepted_owned_counts = torch.zeros_like(old_owned_counts)
+        old_owned_counts.scatter_add_(0, seq_ids_local,
+                                      old_owner.to(torch.int32))
+        new_owned_counts.scatter_add_(0, seq_ids_local,
+                                      new_owner.to(torch.int32))
+        accepted_owned_counts.scatter_add_(0, seq_ids_local,
+                                           accepted_owner.to(torch.int32))
+        kv_lens_delta = accepted_owned_counts + new_owned_counts - old_owned_counts
+
+        if restore:
+            attn_metadata.helix_position_offsets[token_start:token_end].copy_(
+                old_positions.to(torch.int32))
+            attn_metadata.helix_is_inactive_rank[token_start:token_end].copy_(
+                ~old_owner)
+            return -kv_lens_delta
+
+        attn_metadata.helix_position_offsets[token_start:token_end].copy_(
+            new_positions.to(torch.int32))
+        attn_metadata.helix_is_inactive_rank[token_start:token_end].copy_(
+            ~new_owner)
+        return kv_lens_delta
+
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
             num_tokens = attn_metadata.num_tokens
@@ -2168,20 +2287,26 @@ class PyTorchModelEngine(ModelEngine):
                 # Use tp_cp_allgather so MoE (which sees the repurposed
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
-                num_tokens = _maybe_helix_cp_shard_count(
-                    self.mapping, num_tokens)
+                num_tokens = _get_num_tokens_after_helix_cp(
+                    num_tokens, self.mapping)
                 return list(self.dist.tp_cp_allgather(num_tokens))
             return list(self.dist.tp_allgather(num_tokens))
         return None
 
     def _get_spec_all_rank_num_tokens(self, spec_num_tokens: int,
                                       num_sequences: int):
-        spec_num_tokens = _maybe_helix_cp_shard_count(self.mapping,
-                                                      spec_num_tokens)
-        num_sequences = _maybe_helix_cp_shard_count(self.mapping,
-                                                    num_sequences)
+        spec_num_tokens = _get_num_tokens_after_helix_cp(
+            spec_num_tokens, self.mapping)
+        num_sequences = _get_num_tokens_after_helix_cp(
+            num_sequences, self.mapping)
         return list(
             self.dist.tp_cp_allgather([spec_num_tokens, num_sequences]))
+
+    def _get_num_tokens_before_helix_cp(self, num_tokens: int) -> int:
+        """Convert post-Helix-CP chunk token count to full-token capacity."""
+        if self.mapping.has_cp_helix():
+            return num_tokens * self.mapping.cp_size
+        return num_tokens
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
@@ -2234,19 +2359,27 @@ class PyTorchModelEngine(ModelEngine):
                     all_rank_ctx_requests is not None
                     and any(ctx_requests != 0
                             for ctx_requests in all_rank_ctx_requests))
+                max_piecewise_num_tokens = max(
+                    self._get_num_tokens_before_helix_cp(num_tokens)
+                    for num_tokens in attn_all_rank_num_tokens)
                 can_run_piecewise_cuda_graph = (has_ctx_requests and
-                                                max(attn_all_rank_num_tokens)
+                                                max_piecewise_num_tokens
                                                 <= max_captured_num_tokens)
                 all_ranks_can_run_piecewise_cuda_graph = list(
                     self.dist.tp_allgather(can_run_piecewise_cuda_graph))
                 if all(all_ranks_can_run_piecewise_cuda_graph):
                     padded_num_tokens = get_padded_piecewise_tokens(
-                        max(attn_all_rank_num_tokens))
+                        max_piecewise_num_tokens)
+                    if self.mapping.has_cp_helix():
+                        padded_all_rank_num_tokens = math.ceil(
+                            padded_num_tokens / self.mapping.cp_size)
+                    else:
+                        padded_all_rank_num_tokens = padded_num_tokens
                     logger.debug(
                         f"Pad tensor with {total_num_tokens} tokens to {padded_num_tokens} tokens"
                     )
                     return padded_num_tokens, True, [
-                        padded_num_tokens
+                        padded_all_rank_num_tokens
                     ] * len(attn_all_rank_num_tokens)
                 else:
                     logger.debug(
@@ -4214,14 +4347,14 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                attn_num_tokens = _maybe_helix_cp_shard_count(
-                    self.mapping, attn_metadata.num_tokens)
-                spec_num_tokens = _maybe_helix_cp_shard_count(
-                    self.mapping, spec_metadata.num_tokens)
-                num_sequences = _maybe_helix_cp_shard_count(
-                    self.mapping, len(sequence_lengths))
+                attn_num_tokens = _get_num_tokens_after_helix_cp(
+                    attn_metadata.num_tokens, self.mapping)
+                spec_num_tokens = _get_num_tokens_after_helix_cp(
+                    spec_metadata.num_tokens, self.mapping)
+                subseq_num_tokens = _get_num_tokens_after_helix_cp(
+                    len(sequence_lengths), self.mapping)
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [attn_num_tokens, spec_num_tokens, num_sequences])
+                    [attn_num_tokens, spec_num_tokens, subseq_num_tokens])
                 attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -4229,11 +4362,8 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata, [item[1] for item in all_rank_num_tokens],
                     [item[2] for item in all_rank_num_tokens])
             else:
-                attn_num_tokens = _maybe_helix_cp_shard_count(
-                    self.mapping, attn_metadata.num_tokens)
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    attn_num_tokens)
-                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+                attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
+                    attn_metadata)
 
         return inputs, None
 

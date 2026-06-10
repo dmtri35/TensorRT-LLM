@@ -1696,11 +1696,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
+            skip_helix_input_allgather=True,
             **kwargs,
         )
         residual = maybe_slice_for_helix_cp(residual, attn_metadata,
                                             self.mapping_with_cp,
-                                            self.layer_idx)
+                                            self.layer_idx,
+                                            force_slice=True)
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:

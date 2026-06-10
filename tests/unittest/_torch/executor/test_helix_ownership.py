@@ -20,7 +20,8 @@ from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3MTP
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
-    _helix_count_owned_decode_indices, _helix_owns_decode_index)
+    _helix_count_owned_decode_indices, _helix_owns_decode_index,
+    _helix_spec_overlap_reserve)
 from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 
@@ -203,3 +204,32 @@ def test_deepseek_mtp_eh_proj_split_uses_projection_layout():
     sliced = mtp._split_eh_proj_input(hidden_states)
 
     assert torch.equal(sliced, hidden_states[:, 8:])
+
+
+def test_helix_spec_overlap_reserve_covers_shifted_verify_window():
+    draft_len = 1
+    tokens_per_block = 2
+    cp_size = 3
+    reserve = _helix_spec_overlap_reserve(draft_len, max_draft_len=1)
+
+    assert reserve == 3
+
+    for accepted_tokens in range(1, draft_len + 2):
+        current_window_end = accepted_tokens + draft_len
+        assert current_window_end <= reserve
+        accepted_drafts = accepted_tokens - 1
+
+        for cp_rank in range(cp_size):
+            allocated = _helix_count_owned_decode_indices(
+                0, reserve + 1, tokens_per_block, cp_size, cp_rank)
+            rewound = _helix_count_owned_decode_indices(
+                accepted_tokens, reserve - accepted_drafts, tokens_per_block,
+                cp_size, cp_rank)
+            kept = _helix_count_owned_decode_indices(
+                0, accepted_tokens, tokens_per_block, cp_size, cp_rank)
+
+            assert allocated - rewound == kept
+
+
+def test_helix_spec_overlap_reserve_keeps_plain_decode_unchanged():
+    assert _helix_spec_overlap_reserve(draft_len=0, max_draft_len=0) == 0

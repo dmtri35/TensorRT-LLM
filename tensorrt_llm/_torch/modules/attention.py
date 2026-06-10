@@ -319,14 +319,18 @@ def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,
 
 def _helix_cp_allgather_input(hidden_states: torch.Tensor,
                               attn_metadata: AttentionMetadata,
-                              mapping: Mapping, layer_idx: int) -> torch.Tensor:
+                              mapping: Mapping,
+                              layer_idx: int,
+                              input_is_full: bool = False) -> torch.Tensor:
     """AllGather hidden states from CP group for layers after the first.
 
     The first layer already has the full input from the embedding.
     Subsequent layers need to undo the previous layer's reduce-scatter.
+    MTP layers also start from full-token hidden states, so they can skip
+    this allgather even when their layer index is nonzero.
     """
     if (mapping.has_cp_helix() and mapping.enable_attention_dp
-            and layer_idx > 0):
+            and layer_idx > 0 and not input_is_full):
         hidden_states = cp_allgather(hidden_states, mapping, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
     return hidden_states
@@ -370,20 +374,24 @@ def _helix_cp_output_projection(
 def maybe_slice_for_helix_cp(tensor: torch.Tensor,
                              attn_metadata: AttentionMetadata,
                              mapping_with_cp: Optional[Mapping],
-                             layer_idx: int) -> torch.Tensor:
+                             layer_idx: int,
+                             force_slice: bool = False) -> torch.Tensor:
     """Slice a tensor to this CP rank's chunk after reduce-scatter.
 
     For the first decoder layer, the residual comes from the embedding and
     has not been through a prior reduce-scatter.  This function slices it
     so it aligns with the reduce-scattered attention output.  For
     subsequent layers the residual already has the correct size, so this
-    is a no-op.
+    is a no-op.  MTP layers can start from a full-token residual even when
+    their global layer index is nonzero; those callers can force the slice
+    after Helix reduce-scatter.
 
     Call this in the decoder layer on the residual *after* the attention
     forward, so that Attention/MLA forward signatures stay unchanged.
     """
+    should_slice = force_slice or layer_idx == 0
     if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
-            and mapping_with_cp.enable_attention_dp and layer_idx == 0):
+            and mapping_with_cp.enable_attention_dp and should_slice):
         tensor, chunk_size = _helix_cp_pad(tensor, attn_metadata.num_tokens,
                                            mapping_with_cp.cp_size)
         start = mapping_with_cp.cp_rank * chunk_size
@@ -986,6 +994,7 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
         relative_attention_bias: Optional[torch.Tensor] = None,
         relative_attention_max_distance: int = 0,
+        skip_helix_input_allgather: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -1004,8 +1013,12 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
-                                                  self.mapping, self.layer_idx)
+        hidden_states = _helix_cp_allgather_input(
+            hidden_states,
+            attn_metadata,
+            self.mapping,
+            self.layer_idx,
+            input_is_full=skip_helix_input_allgather)
 
         qkv = self.qkv_proj(hidden_states)
 
@@ -3479,10 +3492,15 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
+        skip_helix_input_allgather: bool = False,
     ) -> torch.Tensor:
 
-        hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
-                                                  self.mapping, self.layer_idx)
+        hidden_states = _helix_cp_allgather_input(
+            hidden_states,
+            attn_metadata,
+            self.mapping,
+            self.layer_idx,
+            input_is_full=skip_helix_input_allgather)
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
