@@ -1263,8 +1263,6 @@ int AttentionOp::mlaGeneration(
             stepRunnerParams.seqLensKvPtr = stepKvLensPtr;
             stepRunnerParams.mMaxSeqLenQ = 1;
             stepRunnerParams.mSumOfSeqLensQ = batch_beam;
-            stepRunnerParams.mMultiCtasKvMode = false;
-            stepRunnerParams.mTileScheduler = TileScheduler::Persistent;
 
             for (int32_t step = 0; step < seqLenQ; ++step)
             {
