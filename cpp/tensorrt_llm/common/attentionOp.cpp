@@ -1109,7 +1109,6 @@ int AttentionOp::mlaGeneration(
         void* scratchPtr = nextWorkspacePtr(workspace_byte_ptr, offset, getFmhaMultiCtasKvScratchSize());
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
-        // Parameters to select kernels.
         // MLA generation kernels use dense mask. For multi-token generation, TRTLLM-Gen applies causality by
         // shrinking each token's effective KV length.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
