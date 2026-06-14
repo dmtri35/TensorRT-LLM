@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -510,7 +510,11 @@ public:
 private:
     void validate()
     {
-        TLLM_CHECK(!mInputTokenIds.empty());
+        // Empty input tokens are allowed. A disaggregated generation request receives its KV cache
+        // from the context server instead of recomputing it from tokens (this includes Helix
+        // context-parallelism ranks that own zero KV-cache blocks). The request type and context
+        // phase params that identify such a request are set after construction, so the empty-token
+        // case cannot be gated here.
         TLLM_CHECK(mMaxNewTokens > 0);
 
         // Show warning message unless mNumReturnSequences is the default value.
