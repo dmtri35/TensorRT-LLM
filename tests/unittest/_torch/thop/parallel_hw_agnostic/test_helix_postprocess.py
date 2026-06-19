@@ -14,12 +14,14 @@
 # limitations under the License.
 
 import unittest
+from types import SimpleNamespace
 
 import pytest
 import torch
 from parameterized import parameterized
 
 import tensorrt_llm
+from tensorrt_llm._torch.modules.attention import _helix_zero_kv_mask
 
 
 def baseline(gathered_o, gathered_stats, kv_lora_rank, scale, native_v1=False, native_v2=False):
@@ -91,6 +93,17 @@ class TestHelixPostProcess(unittest.TestCase):
         tensorrt_llm.logger.set_level("warning")
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
+
+    def test_helix_zero_kv_mask_expands_sequence_mask_to_tokens(self):
+        metadata = SimpleNamespace(
+            kv_lens_cuda=torch.tensor([0, 7, 0], dtype=torch.int32),
+            seq_lens_cuda=torch.tensor([2, 1, 3], dtype=torch.int32),
+            num_seqs=3,
+        )
+
+        mask = _helix_zero_kv_mask(metadata, num_tokens=6)
+
+        assert mask.tolist() == [True, True, False, True, True, True]
 
     def _test_helix_postprocess(
         self,

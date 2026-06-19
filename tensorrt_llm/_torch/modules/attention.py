@@ -149,14 +149,34 @@ def _helix_zero_kv_mask(attn_metadata: AttentionMetadata,
                         num_tokens: int) -> Optional[torch.Tensor]:
     """Return a bool mask marking tokens with zero local KV length on this CP rank.
 
-    These are ranks that own no blocks for the sequence. The mask is derived from
-    the static kv_lens_cuda buffer so it stays CUDA-graph safe. Returns None when
-    the buffer is unavailable.
+    These are ranks that own no blocks for the sequence. kv_lens_cuda is stored
+    per sequence, while Helix post-processing consumes rows packed per token. Use
+    seq_lens_cuda to expand sequence-level zero-KV flags to token rows with a
+    static num_tokens-sized result. Returns None when the KV length buffer is
+    unavailable.
     """
     kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
     if kv_lens is None:
         return None
-    return kv_lens[:num_tokens] == 0
+    kv_lens = kv_lens.reshape(-1)
+    seq_lens = getattr(attn_metadata, "seq_lens_cuda", None)
+    num_seqs = getattr(attn_metadata, "num_seqs", None)
+    if seq_lens is None or num_seqs is None:
+        return kv_lens[:num_tokens] == 0
+
+    if num_seqs == 0:
+        return torch.zeros(num_tokens, dtype=torch.bool, device=kv_lens.device)
+
+    seq_lens = seq_lens[:num_seqs].to(device=kv_lens.device, dtype=torch.long)
+    zero_seq_mask = kv_lens[:num_seqs] == 0
+    if num_tokens == num_seqs:
+        return zero_seq_mask[:num_tokens]
+
+    cu_q_lens = torch.cumsum(seq_lens, dim=0)
+    token_ids = torch.arange(num_tokens, dtype=torch.long, device=kv_lens.device)
+    seq_ids = torch.searchsorted(cu_q_lens, token_ids, right=True)
+    seq_ids = torch.clamp(seq_ids, max=num_seqs - 1)
+    return (token_ids < cu_q_lens[-1]) & zero_seq_mask[seq_ids]
 
 
 def _helix_sanitize_empty_kv(
@@ -182,12 +202,15 @@ def _helix_sanitize_empty_kv(
     if zero_kv_mask is None:
         return partial_o, softmax_stats
     num_tokens = partial_o.shape[0]
-    mask = zero_kv_mask[:num_tokens].view(-1, 1)
+    mask = zero_kv_mask.reshape(-1)[:num_tokens]
+    partial_o_mask = mask.view((num_tokens, ) + (1, ) * (partial_o.dim() - 1))
+    softmax_mask = mask.view((num_tokens, ) +
+                             (1, ) * (softmax_stats.dim() - 2))
     # masked_fill overwrites masked rows regardless of their current (possibly NaN)
     # value and is CUDA-graph safe due to static shapes.
-    partial_o = partial_o.masked_fill(mask, 0.0)
-    sm_max = softmax_stats[..., 0].masked_fill(mask, float("-inf"))
-    sm_sum = softmax_stats[..., 1].masked_fill(mask, 0.0)
+    partial_o = partial_o.masked_fill(partial_o_mask, 0.0)
+    sm_max = softmax_stats[..., 0].masked_fill(softmax_mask, float("-inf"))
+    sm_sum = softmax_stats[..., 1].masked_fill(softmax_mask, 0.0)
     softmax_stats = torch.stack([sm_max, sm_sum], dim=-1)
     return partial_o, softmax_stats
 
