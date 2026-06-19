@@ -12,8 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
+import torch
+
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     _helix_count_owned_decode_indices, _helix_owns_decode_index)
+from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 
 def test_helix_decode_index_owner_is_round_robin_by_block():
@@ -65,3 +70,34 @@ def test_helix_owned_count_matches_naive_scan_for_unaligned_ranges():
                 assert _helix_count_owned_decode_indices(
                     start_index, count, tokens_per_block, cp_size,
                     cp_rank) == expected
+
+
+def test_helix_mtp_owner_mask_keeps_local_context_tokens_active():
+
+    class Mapping:
+
+        cp_size = 2
+        cp_rank = 0
+
+        def has_cp_helix(self):
+            return True
+
+    worker = object.__new__(MTPWorker)
+    worker.model_config = SimpleNamespace(mapping=Mapping())
+    attn_metadata = SimpleNamespace(
+        tokens_per_block=4,
+        num_tokens=4,
+        seq_lens_cuda=torch.tensor([4], dtype=torch.int32),
+        helix_total_input_len=torch.tensor([10], dtype=torch.int32),
+        helix_position_offsets=torch.empty(4, dtype=torch.int32),
+        helix_is_inactive_rank=torch.empty(4, dtype=torch.bool),
+    )
+
+    owner_counts = worker._helix_draft_owner_mask(
+        attn_metadata,
+        torch.tensor([8, 9, 10, 11], dtype=torch.int32),
+        batch_size=1,
+    )
+
+    assert owner_counts.item() == 4
+    assert not attn_metadata.helix_is_inactive_rank.any()
