@@ -83,6 +83,12 @@ from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 
+def _maybe_helix_cp_shard_count(mapping: Mapping, num_tokens: int) -> int:
+    if mapping.has_cp_helix():
+        return math.ceil(num_tokens / mapping.cp_size)
+    return num_tokens
+
+
 class ModelEngine(ABC):
 
     @abstractmethod
@@ -2162,10 +2168,20 @@ class PyTorchModelEngine(ModelEngine):
                 # Use tp_cp_allgather so MoE (which sees the repurposed
                 # mapping where tp_size = original tp * cp) can index
                 # with its tp_rank.
-                num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
+                num_tokens = _maybe_helix_cp_shard_count(
+                    self.mapping, num_tokens)
                 return list(self.dist.tp_cp_allgather(num_tokens))
             return list(self.dist.tp_allgather(num_tokens))
         return None
+
+    def _get_spec_all_rank_num_tokens(self, spec_num_tokens: int,
+                                      num_sequences: int):
+        spec_num_tokens = _maybe_helix_cp_shard_count(self.mapping,
+                                                      spec_num_tokens)
+        num_sequences = _maybe_helix_cp_shard_count(self.mapping,
+                                                    num_sequences)
+        return list(
+            self.dist.tp_cp_allgather([spec_num_tokens, num_sequences]))
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):
         if self.enable_attention_dp:
@@ -2560,9 +2576,8 @@ class PyTorchModelEngine(ModelEngine):
             # Handle distributed spec metadata
             if enable_attention_dp:
                 sequence_lengths = spec_metadata.seq_lens
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [spec_metadata.num_tokens,
-                     len(sequence_lengths)])
+                all_rank_num_tokens = self._get_spec_all_rank_num_tokens(
+                    spec_metadata.num_tokens, len(sequence_lengths))
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
                     [item[1] for item in all_rank_num_tokens])
@@ -4032,9 +4047,8 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
             if self.enable_attention_dp:
-                all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    [spec_metadata.num_tokens,
-                     len(sequence_lengths)])
+                all_rank_num_tokens = self._get_spec_all_rank_num_tokens(
+                    spec_metadata.num_tokens, len(sequence_lengths))
                 self._set_spec_metadata_all_rank_num_tokens(
                     spec_metadata, [item[0] for item in all_rank_num_tokens],
                     [item[1] for item in all_rank_num_tokens])
@@ -4200,10 +4214,14 @@ class PyTorchModelEngine(ModelEngine):
         # support attention dp
         if self.enable_attention_dp:
             if spec_metadata is not None:
-                all_rank_num_tokens = self.dist.tp_cp_allgather([
-                    attn_metadata.num_tokens, spec_metadata.num_tokens,
-                    len(sequence_lengths)
-                ])
+                attn_num_tokens = _maybe_helix_cp_shard_count(
+                    self.mapping, attn_metadata.num_tokens)
+                spec_num_tokens = _maybe_helix_cp_shard_count(
+                    self.mapping, spec_metadata.num_tokens)
+                num_sequences = _maybe_helix_cp_shard_count(
+                    self.mapping, len(sequence_lengths))
+                all_rank_num_tokens = self.dist.tp_cp_allgather(
+                    [attn_num_tokens, spec_num_tokens, num_sequences])
                 attn_metadata.all_rank_num_tokens = [
                     item[0] for item in all_rank_num_tokens
                 ]
@@ -4211,8 +4229,10 @@ class PyTorchModelEngine(ModelEngine):
                     spec_metadata, [item[1] for item in all_rank_num_tokens],
                     [item[2] for item in all_rank_num_tokens])
             else:
+                attn_num_tokens = _maybe_helix_cp_shard_count(
+                    self.mapping, attn_metadata.num_tokens)
                 all_rank_num_tokens = self.dist.tp_cp_allgather(
-                    attn_metadata.num_tokens)
+                    attn_num_tokens)
                 attn_metadata.all_rank_num_tokens = all_rank_num_tokens
 
         return inputs, None

@@ -18,6 +18,7 @@ import torch
 
 from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3MTP
 from tensorrt_llm._torch.modules.linear import TensorParallelMode
+from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     _helix_count_owned_decode_indices, _helix_owns_decode_index)
 from tensorrt_llm._torch.speculative.mtp import MTPWorker
@@ -151,6 +152,37 @@ def test_helix_mtp_owner_mask_uses_static_repeat_sizes(monkeypatch):
                        torch.tensor([False, False, False, False, True]))
     assert torch.equal(attn_metadata.helix_zero_kv_mask,
                        torch.tensor([True, True, False, False, False]))
+
+
+def test_helix_mtp_spec_all_rank_counts_use_cp_shards():
+
+    class Mapping:
+
+        cp_size = 4
+
+        def has_cp_helix(self):
+            return True
+
+    class Dist:
+
+        def __init__(self):
+            self.gathered_value = None
+
+        def tp_cp_allgather(self, value):
+            self.gathered_value = value
+            return [value, value]
+
+    engine = object.__new__(PyTorchModelEngine)
+    engine.mapping = Mapping()
+    engine.dist = Dist()
+
+    all_rank_counts = engine._get_spec_all_rank_num_tokens(
+        spec_num_tokens=128,
+        num_sequences=32,
+    )
+
+    assert engine.dist.gathered_value == [32, 8]
+    assert all_rank_counts == [[32, 8], [32, 8]]
 
 
 def test_deepseek_mtp_eh_proj_split_uses_projection_layout():
