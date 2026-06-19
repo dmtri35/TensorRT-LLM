@@ -1645,6 +1645,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
+    def _split_eh_proj_input(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if (self.eh_proj.tp_mode == TensorParallelMode.ROW
+                and self.eh_proj.tp_size > 1):
+            return torch.chunk(hidden_states, self.eh_proj.tp_size,
+                               dim=-1)[self.eh_proj.tp_rank]
+        return hidden_states
+
     def forward(
         self,
         input_ids: torch.IntTensor,
@@ -1672,12 +1679,10 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             disable_on_compile=True,
         )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
-        # Split hidden_states columnwise based on TP
-        tp_size = self.model_config.mapping.tp_size
-        tp_rank = self.model_config.mapping.tp_rank
-
-        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
-            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
+        # Split hidden_states columnwise based on eh_proj's layout.
+        # For Helix, model_config.mapping is restored after initialization, while
+        # eh_proj keeps the temporary CP-as-TP layout it was built with.
+        hidden_states = self._split_eh_proj_input(hidden_states)
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm

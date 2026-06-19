@@ -16,6 +16,8 @@ from types import SimpleNamespace
 
 import torch
 
+from tensorrt_llm._torch.models.modeling_deepseekv3 import DeepseekV3MTP
+from tensorrt_llm._torch.modules.linear import TensorParallelMode
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     _helix_count_owned_decode_indices, _helix_owns_decode_index)
 from tensorrt_llm._torch.speculative.mtp import MTPWorker
@@ -101,3 +103,23 @@ def test_helix_mtp_owner_mask_keeps_local_context_tokens_active():
 
     assert owner_counts.item() == 4
     assert not attn_metadata.helix_is_inactive_rank.any()
+
+
+def test_deepseek_mtp_eh_proj_split_uses_projection_layout():
+    mtp = object.__new__(DeepseekV3MTP)
+    mtp.model_config = SimpleNamespace(
+        mapping=SimpleNamespace(
+            tp_size=1,
+            tp_rank=0,
+            enable_attention_dp=False,
+        ))
+    mtp.eh_proj = SimpleNamespace(
+        tp_mode=TensorParallelMode.ROW,
+        tp_size=2,
+        tp_rank=1,
+    )
+    hidden_states = torch.arange(16, dtype=torch.float32).reshape(1, 16)
+
+    sliced = mtp._split_eh_proj_input(hidden_states)
+
+    assert torch.equal(sliced, hidden_states[:, 8:])
