@@ -105,6 +105,16 @@ class TestHelixPostProcess(unittest.TestCase):
 
         assert mask.tolist() == [True, True, False, True, True, True]
 
+    def test_helix_zero_kv_mask_prefers_precomputed_token_mask(self):
+        metadata = SimpleNamespace(
+            kv_lens_cuda=torch.tensor([1, 1], dtype=torch.int32),
+            helix_zero_kv_mask=torch.tensor([False, True, True, False]),
+        )
+
+        mask = _helix_zero_kv_mask(metadata, num_tokens=3)
+
+        assert mask.tolist() == [False, True, True]
+
     def _test_helix_postprocess(
         self,
         cp_size,

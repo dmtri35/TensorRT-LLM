@@ -158,6 +158,10 @@ def _helix_zero_kv_mask(attn_metadata: AttentionMetadata,
     kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
     if kv_lens is None:
         return None
+    helix_zero_kv_mask = getattr(attn_metadata, "helix_zero_kv_mask", None)
+    if helix_zero_kv_mask is not None:
+        return helix_zero_kv_mask[:num_tokens]
+
     kv_lens = kv_lens.reshape(-1)
     seq_lens = getattr(attn_metadata, "seq_lens_cuda", None)
     num_seqs = getattr(attn_metadata, "num_seqs", None)
@@ -165,7 +169,7 @@ def _helix_zero_kv_mask(attn_metadata: AttentionMetadata,
         return kv_lens[:num_tokens] == 0
 
     if num_seqs == 0:
-        return torch.zeros(num_tokens, dtype=torch.bool, device=kv_lens.device)
+        return kv_lens[:num_tokens] == 0
 
     seq_lens = seq_lens[:num_seqs].to(device=kv_lens.device, dtype=torch.long)
     zero_seq_mask = kv_lens[:num_seqs] == 0
