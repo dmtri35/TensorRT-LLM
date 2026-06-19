@@ -105,6 +105,54 @@ def test_helix_mtp_owner_mask_keeps_local_context_tokens_active():
     assert not attn_metadata.helix_is_inactive_rank.any()
 
 
+def test_helix_mtp_owner_mask_uses_static_repeat_sizes(monkeypatch):
+
+    class Mapping:
+
+        cp_size = 2
+        cp_rank = 0
+
+        def has_cp_helix(self):
+            return True
+
+    real_repeat_interleave = torch.repeat_interleave
+
+    def require_output_size(values, repeats, *args, **kwargs):
+        if torch.is_tensor(repeats) and "output_size" not in kwargs:
+            raise AssertionError(
+                "tensor repeat counts must provide output_size")
+        return real_repeat_interleave(values, repeats, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "repeat_interleave", require_output_size)
+
+    worker = object.__new__(MTPWorker)
+    worker.model_config = SimpleNamespace(mapping=Mapping())
+    attn_metadata = SimpleNamespace(
+        tokens_per_block=2,
+        num_tokens=5,
+        seq_lens_cuda=torch.tensor([2, 3], dtype=torch.int32),
+        kv_lens_cuda=torch.tensor([0, 5], dtype=torch.int32),
+        helix_total_input_len=torch.tensor([10, 20], dtype=torch.int32),
+        helix_position_offsets=torch.empty(5, dtype=torch.int32),
+        helix_is_inactive_rank=torch.empty(5, dtype=torch.bool),
+        helix_zero_kv_mask=torch.empty(5, dtype=torch.bool),
+    )
+
+    owner_counts = worker._helix_draft_owner_mask(
+        attn_metadata,
+        torch.tensor([10, 11, 20, 21, 22], dtype=torch.int32),
+        batch_size=2,
+    )
+
+    assert torch.equal(owner_counts, torch.tensor([2, 2], dtype=torch.int32))
+    assert torch.equal(attn_metadata.helix_position_offsets,
+                       torch.tensor([10, 11, 20, 21, 22], dtype=torch.int32))
+    assert torch.equal(attn_metadata.helix_is_inactive_rank,
+                       torch.tensor([False, False, False, False, True]))
+    assert torch.equal(attn_metadata.helix_zero_kv_mask,
+                       torch.tensor([True, True, False, False, False]))
+
+
 def test_deepseek_mtp_eh_proj_split_uses_projection_layout():
     mtp = object.__new__(DeepseekV3MTP)
     mtp.model_config = SimpleNamespace(
