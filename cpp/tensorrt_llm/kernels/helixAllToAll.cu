@@ -239,14 +239,31 @@ __device__ __forceinline__ HelixFifoInfo* getReceiverHelixFifoInfo(
 __device__ __forceinline__ void startWorkspaceS2GReg(
     uint64_t* fifoEntry, uint8_t* sharedMemoryBase, int send128ByteCount, int fifo128ByteOffset, int laneId)
 {
-    int copyInt4Count = send128ByteCount * BYTES_PER_128B_BLOCK / sizeof(int4);
-    int4* sharedMemoryInt4 = reinterpret_cast<int4*>(sharedMemoryBase);
+    int copyU64Count = send128ByteCount * UINT64_PER_128B_BLOCK;
+    auto* sharedMemoryU64 = reinterpret_cast<uint64_t*>(sharedMemoryBase);
     uint64_t* fifoPtr = fifoEntry + fifo128ByteOffset * UINT64_PER_128B_BLOCK;
-    int4* fifoPtrInt4 = reinterpret_cast<int4*>(fifoPtr);
-#pragma unroll 4
-    for (int i = laneId; i < copyInt4Count; i += WARP_SIZE)
+
+    // LL128 uses one uint64 flag inside every 128-byte block.  Publish payload
+    // and tail data before publishing those flags; otherwise a receiver can
+    // observe the flag and unpack stale bytes from the same FIFO entry.
+    for (int i = laneId; i < copyU64Count; i += WARP_SIZE)
     {
-        fifoPtrInt4[i] = sharedMemoryInt4[i];
+        int blockIdx128B = i / UINT64_PER_128B_BLOCK;
+        int innerIdx = i % UINT64_PER_128B_BLOCK;
+        int flagInnerIdx = (fifo128ByteOffset + blockIdx128B) % UINT64_PER_128B_BLOCK;
+        if (innerIdx != flagInnerIdx)
+        {
+            fifoPtr[i] = sharedMemoryU64[i];
+        }
+    }
+    __syncwarp();
+    __threadfence_system();
+
+    for (int blockIdx128B = laneId; blockIdx128B < send128ByteCount; blockIdx128B += WARP_SIZE)
+    {
+        int flagInnerIdx = (fifo128ByteOffset + blockIdx128B) % UINT64_PER_128B_BLOCK;
+        int flagIdx = blockIdx128B * UINT64_PER_128B_BLOCK + flagInnerIdx;
+        fifoPtr[flagIdx] = sharedMemoryU64[flagIdx];
     }
 }
 
@@ -349,15 +366,12 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
+    // Do not explicitly trigger PDL completion from this kernel.  The
+    // dependent postprocess kernel consumes receive buffers populated by the
+    // receiver CTAs, so it must wait for the all-to-all grid to complete.
 
     if (isSender)
     {
-        // sender blocks should trigger next kernel immediately, s.t. they
-        // do not block the next kernel from starting
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
-
         // Sender logic: send data from cpRank's slice to peerRank
         int64_t head = senderFifo->head;
         int64_t tail = senderFifo->tail;
@@ -427,15 +441,6 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
         // Start at channel index, increment by total channel count
         for (int entryIdx = pairInfo.channel; entryIdx < params.entryCount; entryIdx += runChannelCount)
         {
-            // receiver blocks should trigger next kernel at last iteration
-            // note: some blocks might not even go into this for-loop, but they
-            // would exit which is equivalent to the pre-exit trigger
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-            if (entryIdx + runChannelCount >= params.entryCount)
-            {
-                cudaTriggerProgrammaticLaunchCompletion();
-            }
-#endif
             // dataIndex points to where we receive data from peerRank in this entry
             int dataIndex = entryIdx * params.cpSize + peerRank;
             int loaded128ByteCount = 0;
@@ -475,8 +480,13 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
             // note: fields are already unpacked in shared memory
             s2gAllFields<ALLOW_VARIABLE_FIELD1>(params.recvFields, dataIndex, shmem, laneId);
-            // wait for data to be read from shared memory
-            cp_async_bulk_wait_group_read<0>();
+            // Wait for the shared-to-global writes to complete before the
+            // shared memory can be reused or dependent kernels can consume the
+            // receive buffers.
+            cp_async_bulk_wait_group<0>();
+            // Receiver blocks intentionally release dependent kernels by
+            // exiting instead of by an explicit PDL trigger; postprocess
+            // consumes the receive buffers produced here.
 
             // note: LL128Proto doesn't need rearm
             // rearmFifoBuffer();
@@ -588,7 +598,11 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
+    // The postprocess kernel launched after Helix all-to-all consumes the
+    // receive buffers written by this grid.  Programmatic stream serialization
+    // can let that consumer run before the receiver CTAs finish their
+    // shared-to-global copies, so keep normal stream ordering for this kernel.
+    attrs[0].val.programmaticStreamSerializationAllowed = false;
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params));
