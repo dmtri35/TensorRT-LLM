@@ -1267,6 +1267,10 @@ int AttentionOp::mlaGeneration(
 
             TllmGenFmhaRunnerParams stepRunnerParams = tllmRunnerParams;
             stepRunnerParams.oSfPtr = nullptr;
+            // Each microstep is a single query token over an already-truncated KV
+            // prefix. Dense and causal masks are equivalent for Q=1, and the
+            // Blackwell TRTLLM-Gen MLA cubins for this shape are indexed as causal.
+            stepRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
             stepRunnerParams.mMaxSeqLenQ = 1;
             stepRunnerParams.mSumOfSeqLensQ = batch_beam;
 
