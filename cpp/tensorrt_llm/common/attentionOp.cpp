@@ -1111,10 +1111,7 @@ int AttentionOp::mlaGeneration(
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
         void* scratchPtr = nextWorkspacePtr(workspace_byte_ptr, offset, getFmhaMultiCtasKvScratchSize());
         TllmGenFmhaRunnerParams tllmRunnerParams{};
-
-        // MLA generation kernels use dense mask. For multi-token generation, TRTLLM-Gen applies causality by
-        // shrinking each token's effective KV length.
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
+        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         bool const useMultiCtasKvMode = mMultiBlockMode || generation_params.softmax_stats != nullptr;
         tllmRunnerParams.mMultiCtasKvMode = useMultiCtasKvMode;

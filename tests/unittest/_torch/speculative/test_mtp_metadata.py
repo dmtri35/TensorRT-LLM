@@ -14,6 +14,7 @@
 
 import torch
 
+from tensorrt_llm._torch.pyexecutor import model_engine
 from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 
@@ -58,6 +59,20 @@ class _ModelConfig:
 
     def __init__(self):
         self.mapping = _Mapping()
+
+
+class _ModelEngineMapping:
+
+    def __init__(self, cp_rank):
+        self.cp_size = 2
+        self.cp_rank = cp_rank
+
+
+class _Request:
+
+    def __init__(self, global_decode_len, total_input_len=100):
+        self.py_helix_global_decode_len = global_decode_len
+        self.total_input_len_cp = total_input_len
 
 
 class _HelixMetadata:
@@ -106,3 +121,34 @@ def test_helix_draft_owner_mask_uses_current_position_count():
                        torch.tensor([100, 101, 200], dtype=torch.int))
     assert torch.equal(metadata.helix_is_inactive_rank[:3],
                        torch.tensor([False, False, False]))
+
+
+def test_helix_verify_token_params_first_generation_token():
+    engine = object.__new__(model_engine.PyTorchModelEngine)
+    engine.mapping = _ModelEngineMapping(cp_rank=0)
+
+    positions, inactive, num_active = engine._helix_verify_token_params(
+        _Request(global_decode_len=0), num_draft=2, tokens_per_block=2)
+
+    assert positions == [100, 101, 102]
+    assert inactive == [False, False, True]
+    assert num_active == 2
+
+
+def test_helix_verify_token_params_starts_at_unsettled_decode_index():
+    inactive_by_rank = []
+    active_by_rank = []
+    for cp_rank in range(2):
+        engine = object.__new__(model_engine.PyTorchModelEngine)
+        engine.mapping = _ModelEngineMapping(cp_rank=cp_rank)
+
+        positions, inactive, num_active = engine._helix_verify_token_params(
+            _Request(global_decode_len=3), num_draft=3, tokens_per_block=2)
+
+        assert positions == [103, 104, 105, 106]
+        inactive_by_rank.append(inactive)
+        active_by_rank.append(num_active)
+
+    assert inactive_by_rank[0] == [True, False, False, True]
+    assert inactive_by_rank[1] == [False, True, True, False]
+    assert active_by_rank == [2, 2]
