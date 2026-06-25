@@ -61,6 +61,26 @@ class _ModelConfig:
         self.mapping = _Mapping()
 
 
+class _PretrainedConfig:
+
+    def __init__(self, *, is_mla: bool):
+        if is_mla:
+            self.kv_lora_rank = 512
+            self.qk_rope_head_dim = 64
+
+
+class _RuntimeModelConfig:
+
+    def __init__(self, *, is_mla: bool):
+        self.pretrained_config = _PretrainedConfig(is_mla=is_mla)
+
+
+class _Model:
+
+    def __init__(self, *, is_mla: bool):
+        self.model_config = _RuntimeModelConfig(is_mla=is_mla)
+
+
 class _ModelEngineMapping:
 
     def __init__(self, cp_rank):
@@ -152,3 +172,17 @@ def test_helix_verify_token_params_starts_at_unsettled_decode_index():
     assert inactive_by_rank[0] == [True, False, False, True]
     assert inactive_by_rank[1] == [False, True, True, False]
     assert active_by_rank == [2, 2]
+
+
+def test_helix_mla_skips_spec_decoding_mask():
+    engine = object.__new__(model_engine.PyTorchModelEngine)
+    engine.model = _Model(is_mla=True)
+
+    assert not engine._should_build_helix_spec_decoding_mask()
+
+
+def test_helix_non_mla_builds_spec_decoding_mask():
+    engine = object.__new__(model_engine.PyTorchModelEngine)
+    engine.model = _Model(is_mla=False)
+
+    assert engine._should_build_helix_spec_decoding_mask()

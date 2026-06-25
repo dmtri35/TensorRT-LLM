@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -366,12 +366,15 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
-    // Do not explicitly trigger PDL completion from this kernel.  The
-    // dependent postprocess kernel consumes receive buffers populated by the
-    // receiver CTAs, so it must wait for the all-to-all grid to complete.
 
     if (isSender)
     {
+        // Sender CTAs do not produce the local receive buffers consumed by the
+        // postprocess kernel, so they can release dependent work early.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
         // Sender logic: send data from cpRank's slice to peerRank
         int64_t head = senderFifo->head;
         int64_t tail = senderFifo->tail;
@@ -498,6 +501,12 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             receiverFifo->tail = tail;
             senderFifo->tail = tail;
         }
+
+        // Receiver CTAs release dependent work only after the receive buffers
+        // consumed by postprocess have been fully written.
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+        cudaTriggerProgrammaticLaunchCompletion();
+#endif
     }
 }
 
@@ -598,11 +607,7 @@ void launchHelixAllToAllImpl(HelixAllToAllParams const& params, cudaStream_t str
     config.stream = stream;
     cudaLaunchAttribute attrs[1];
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    // The postprocess kernel launched after Helix all-to-all consumes the
-    // receive buffers written by this grid.  Programmatic stream serialization
-    // can let that consumer run before the receiver CTAs finish their
-    // shared-to-global copies, so keep normal stream ordering for this kernel.
-    attrs[0].val.programmaticStreamSerializationAllowed = false;
+    attrs[0].val.programmaticStreamSerializationAllowed = common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
     TLLM_CUDA_CHECK(cudaLaunchKernelEx(&config, kernel_instance, params));

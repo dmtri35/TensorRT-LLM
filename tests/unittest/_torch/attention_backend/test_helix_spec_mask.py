@@ -17,6 +17,8 @@ import torch
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionInputType
 from tensorrt_llm._torch.attention_backend.trtllm import (
+    TrtllmAttentionMetadata,
+    _build_helix_owned_token_counts,
     _build_helix_spec_decoding_packed_mask,
     _build_helix_spec_decoding_position_offsets,
     _should_use_helix_spec_decoding_mask,
@@ -58,6 +60,60 @@ def test_helix_spec_decoding_mask_uses_owned_suffix_order():
     assert _unpack_row(packed_mask[1, 3], 4) == [0, 1]
 
 
+def test_helix_owned_token_counts_match_mask_counts():
+    seq_lens = torch.tensor([4, 4], dtype=torch.long)
+    helix_is_inactive_rank = torch.tensor(
+        [
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+            True,
+            False,
+        ],
+        dtype=torch.bool,
+    )
+
+    _, mask_owned_counts = _build_helix_spec_decoding_packed_mask(
+        helix_is_inactive_rank, seq_lens)
+    owned_counts = _build_helix_owned_token_counts(helix_is_inactive_rank,
+                                                   seq_lens)
+
+    assert owned_counts.tolist() == mask_owned_counts.tolist()
+
+
+def test_helix_no_mask_metadata_keeps_owned_token_counts():
+    metadata = object.__new__(TrtllmAttentionMetadata)
+    metadata.seq_lens_kv = torch.tensor([4, 4], dtype=torch.int)
+    metadata.num_seqs = 2
+    metadata.helix_spec_decoding_mask_ready = True
+    metadata._helix_spec_decoding_owned_counts_cpu = None
+
+    metadata._update_helix_spec_decoding_metadata(
+        [
+            False,
+            False,
+            True,
+            False,
+            True,
+            False,
+            True,
+            False,
+        ],
+        build_spec_decoding_mask=False,
+    )
+
+    assert not metadata.helix_spec_decoding_mask_ready
+    assert metadata._helix_spec_decoding_owned_counts_cpu.tolist() == [3, 2]
+    assert _should_use_helix_owned_token_counts(
+        is_spec_decoding_enabled=False,
+        helix_owned_token_counts_ready=(
+            metadata._helix_spec_decoding_owned_counts_cpu is not None),
+    )
+
+
 def test_helix_spec_decoding_position_offsets_are_materialized():
     position_offsets = _build_helix_spec_decoding_position_offsets(
         num_seqs=3, max_generation_length=4)
@@ -80,16 +136,7 @@ def test_helix_spec_decoding_mask_is_disabled_for_mla():
     )
 
 
-def test_helix_spec_decoding_mask_metadata_is_enabled_for_mla_microstep(
-        monkeypatch):
-    monkeypatch.setenv("TRTLLM_HELIX_MLA_MTP_MICROSTEP", "1")
-
-    assert _should_use_helix_spec_decoding_mask(
-        is_mla_enable=True,
-        attention_input_type=AttentionInputType.generation_only,
-        mask_ready=True,
-        sm=100,
-    )
+def test_helix_spec_decoding_mask_metadata_is_disabled_for_mla_generation():
     assert not _should_use_helix_spec_decoding_mask(
         is_mla_enable=True,
         attention_input_type=AttentionInputType.generation_only,
@@ -98,22 +145,22 @@ def test_helix_spec_decoding_mask_metadata_is_enabled_for_mla_microstep(
     )
     assert not _should_use_helix_spec_decoding_mask(
         is_mla_enable=True,
-        attention_input_type=AttentionInputType.context_only,
+        attention_input_type=AttentionInputType.generation_only,
         mask_ready=True,
         sm=100,
     )
 
 
-def test_helix_owned_token_counts_use_microstep_mask_readiness():
+def test_helix_owned_token_counts_use_spec_decode_or_mask_readiness():
     assert _should_use_helix_owned_token_counts(
         is_spec_decoding_enabled=True,
-        helix_spec_decoding_mask_ready=False,
+        helix_owned_token_counts_ready=False,
     )
     assert _should_use_helix_owned_token_counts(
         is_spec_decoding_enabled=False,
-        helix_spec_decoding_mask_ready=True,
+        helix_owned_token_counts_ready=True,
     )
     assert not _should_use_helix_owned_token_counts(
         is_spec_decoding_enabled=False,
-        helix_spec_decoding_mask_ready=False,
+        helix_owned_token_counts_ready=False,
     )

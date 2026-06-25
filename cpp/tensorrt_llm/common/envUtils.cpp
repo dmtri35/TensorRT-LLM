@@ -395,11 +395,6 @@ bool getEnvTryZCopyForKVCacheTransfer()
     return zcopyForSysmmetricKVCache;
 }
 
-bool getEnvHelixMlaMtpMicrostep()
-{
-    return getBoolEnv("TRTLLM_HELIX_MLA_MTP_MICROSTEP");
-}
-
 bool getEnvForceDeterministic()
 {
     static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");

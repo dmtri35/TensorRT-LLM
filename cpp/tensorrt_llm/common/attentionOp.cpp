@@ -25,7 +25,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
-#include "tensorrt_llm/kernels/helixMlaMicrostepKernels.h"
+#include "tensorrt_llm/kernels/helixMlaKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -46,22 +46,7 @@ using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::AttentionXqaWorkspaceSizes;
 using tensorrt_llm::common::op::KvCacheBuffers;
 
-namespace
-{
 
-size_t getHelixMlaMicrostepWorkspaceSize(size_t const qElemSize, size_t const oElemSize, int32_t const batchSize,
-    int32_t const seqLenQ, int32_t const numHeads, int32_t const headDimQk, int32_t const headDimV)
-{
-    int const kNumBuffers = 4;
-    size_t workspaces[kNumBuffers];
-    workspaces[0] = qElemSize * batchSize * seqLenQ * numHeads * headDimQk;
-    workspaces[1] = oElemSize * batchSize * seqLenQ * numHeads * headDimV;
-    workspaces[2] = sizeof(float2) * batchSize * seqLenQ * numHeads;
-    workspaces[3] = sizeof(int32_t) * batchSize * seqLenQ;
-    return tc::calculateTotalWorkspaceSize(workspaces, kNumBuffers);
-}
-
-} // namespace
 
 template <typename T>
 struct SATypeConverter
@@ -962,23 +947,13 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         size_t const fmha_scheduler_counter = sizeof(uint32_t);
         size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
 
-        int32_t const headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-
-        int const NUM_BUFFERS = 6;
+        int const NUM_BUFFERS = 5;
         size_t workspaces[NUM_BUFFERS];
         workspaces[0] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_q_len
         workspaces[1] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_kv_len
         workspaces[2] = mIsGenerationMLA ? 0 : fmha_scheduler_counter;
         workspaces[3] = fmha_multi_ctas_kv_scratch_size;
-        bool const needsHelixMlaMicrostepWorkspace = mIsSpecDecodingEnabled
-            && mMLAParams.predicted_tokens_per_seq > 1 && (tc::getEnvHelixMlaMtpMicrostep() || mUseGenFlashMLA);
-        int32_t const helixMlaMicrostepNumHeads = std::max(mNumAttnHeads, mNumHeads);
-        workspaces[4] = needsHelixMlaMicrostepWorkspace
-            ? getHelixMlaMicrostepWorkspaceSize(
-                mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : size, size, batch_beam,
-                mMLAParams.predicted_tokens_per_seq, helixMlaMicrostepNumHeads, headDim, mMLAParams.kv_lora_rank)
-            : 0;
-        workspaces[5] = flash_mla_workspace_size;
+        workspaces[4] = flash_mla_workspace_size;
 
         fmha_v2_mla_workspace_size = tc::calculateTotalWorkspaceSize(workspaces, NUM_BUFFERS);
     }
@@ -1223,72 +1198,7 @@ int AttentionOp::mlaGeneration(
             }
         }
 
-        bool const useHelixMlaMtpMicrostep = tc::getEnvHelixMlaMtpMicrostep() && mCpSize > 1
-            && mIsSpecDecodingEnabled && mUseSpecDecoding && tllmRunnerParams.mMaxSeqLenQ > 1
-            && params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank_per_token;
-        if (useHelixMlaMtpMicrostep)
-        {
-            // TRTLLM-Gen has no Custom-mask MLA cubin for DeepSeek shapes. For
-            // each verify offset, causal Q=1 attention over a truncated local KV
-            // prefix is equivalent to the Helix custom mask row for that token.
-            TLLM_CHECK_WITH_INFO(!useSparseMLA(), "Helix MLA MTP microstep is not supported with sparse MLA.");
-            TLLM_CHECK_WITH_INFO(generation_params.context_buf_sf == nullptr,
-                "Helix MLA MTP microstep does not support NVFP4 attention output.");
-            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_packed_mask != nullptr,
-                "Helix MLA MTP microstep requires spec_decoding_packed_mask.");
-            TLLM_CHECK_WITH_INFO(generation_params.spec_bl_tree_first_sparse_mask_offset_kv != nullptr,
-                "Helix MLA MTP microstep requires spec_bl_tree_first_sparse_mask_offset_kv.");
-            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_max_generation_length >= tllmRunnerParams.mMaxSeqLenQ,
-                "Helix MLA MTP microstep metadata is shorter than the query sequence.");
-            TLLM_CHECK_WITH_INFO(generation_params.softmax_stats != nullptr,
-                "Helix MLA MTP microstep requires softmax stats for Helix reduction.");
-
-            int32_t const seqLenQ = tllmRunnerParams.mMaxSeqLenQ;
-            int32_t const packedMaskSeqStride = generation_params.spec_decoding_max_generation_length;
-            int32_t const packedMaskBlockStride = tc::divUp(packedMaskSeqStride, 32);
-            int32_t const validMaskBlocks = tc::divUp(seqLenQ, 32);
-            auto const qElemSize = mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : sizeof(T);
-            size_t const qRowBytes = qElemSize * tllmRunnerParams.mNumHeadsQ * tllmRunnerParams.mHeadDimQk;
-            size_t const oRowBytes = sizeof(T) * tllmRunnerParams.mNumHeadsQ * tllmRunnerParams.mHeadDimV;
-            void* qStepsPtr = nextWorkspacePtr(workspace_byte_ptr, offset, seqLenQ * batch_beam * qRowBytes);
-            void* oStepsPtr = nextWorkspacePtr(workspace_byte_ptr, offset, seqLenQ * batch_beam * oRowBytes);
-            float2* softmaxStatsStepsPtr = reinterpret_cast<float2*>(nextWorkspacePtr(
-                workspace_byte_ptr, offset, sizeof(float2) * seqLenQ * batch_beam * tllmRunnerParams.mNumHeadsQ));
-            int32_t* stepKvLensPtr = reinterpret_cast<int32_t*>(
-                nextWorkspacePtr(workspace_byte_ptr, offset, sizeof(int32_t) * seqLenQ * batch_beam));
-
-            invokePackHelixMlaMicrosteps(tllmRunnerParams.qPtr, qStepsPtr,
-                generation_params.spec_bl_tree_first_sparse_mask_offset_kv,
-                generation_params.spec_decoding_packed_mask, stepKvLensPtr, batch_beam, seqLenQ, packedMaskSeqStride,
-                packedMaskBlockStride, validMaskBlocks, qRowBytes, stream);
-
-            TllmGenFmhaRunnerParams stepRunnerParams = tllmRunnerParams;
-            stepRunnerParams.oSfPtr = nullptr;
-            // Each microstep is a single query token over an already-truncated KV
-            // prefix. Dense and causal masks are equivalent for Q=1, and the
-            // Blackwell TRTLLM-Gen MLA cubins for this shape are indexed as causal.
-            stepRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
-            stepRunnerParams.mMaxSeqLenQ = 1;
-            stepRunnerParams.mSumOfSeqLensQ = batch_beam;
-
-            auto const qStepsBytePtr = static_cast<int8_t const*>(qStepsPtr);
-            auto const oStepsBytePtr = static_cast<int8_t*>(oStepsPtr);
-            for (int32_t step = 0; step < seqLenQ; ++step)
-            {
-                stepRunnerParams.qPtr = qStepsBytePtr + static_cast<size_t>(step) * batch_beam * qRowBytes;
-                stepRunnerParams.oPtr = oStepsBytePtr + static_cast<size_t>(step) * batch_beam * oRowBytes;
-                stepRunnerParams.softmaxStatsPtr
-                    = softmaxStatsStepsPtr + static_cast<size_t>(step) * batch_beam * tllmRunnerParams.mNumHeadsQ;
-                stepRunnerParams.seqLensKvPtr = stepKvLensPtr + static_cast<size_t>(step) * batch_beam;
-                mTllmGenFMHARunner->run(stepRunnerParams);
-            }
-            invokeUnpackHelixMlaMicrosteps(oStepsPtr, tllmRunnerParams.oPtr, softmaxStatsStepsPtr,
-                tllmRunnerParams.softmaxStatsPtr, batch_beam, seqLenQ, oRowBytes, tllmRunnerParams.mNumHeadsQ, stream);
-        }
-        else
-        {
-            mTllmGenFMHARunner->run(tllmRunnerParams);
-        }
+        mTllmGenFMHARunner->run(tllmRunnerParams);
         sync_check_cuda_error(stream);
     }
     else if (mUseGenFlashMLA)
@@ -1415,65 +1325,11 @@ int AttentionOp::mlaGeneration(
             }
         };
 
-        bool const useHelixFlashMlaMtpMicrostep = mIsSpecDecodingEnabled && mUseSpecDecoding && s_q > 1
-            && params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank_per_token;
-        if (useHelixFlashMlaMtpMicrostep)
-        {
-            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_packed_mask != nullptr,
-                "Helix FlashMLA MTP microstep requires spec_decoding_packed_mask.");
-            TLLM_CHECK_WITH_INFO(generation_params.spec_bl_tree_first_sparse_mask_offset_kv != nullptr,
-                "Helix FlashMLA MTP microstep requires spec_bl_tree_first_sparse_mask_offset_kv.");
-            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_max_generation_length >= s_q,
-                "Helix FlashMLA MTP microstep metadata is shorter than the query sequence.");
-            TLLM_CHECK_WITH_INFO(generation_params.softmax_stats != nullptr,
-                "Helix FlashMLA MTP microstep requires softmax stats for Helix reduction.");
-
-            int32_t const packedMaskSeqStride = generation_params.spec_decoding_max_generation_length;
-            int32_t const packedMaskBlockStride = tc::divUp(packedMaskSeqStride, 32);
-            int32_t const validMaskBlocks = tc::divUp(s_q, 32);
-            auto const qElemSize = mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : sizeof(T);
-            size_t const qRowBytes = qElemSize * params.head_num * head_size;
-            size_t const oRowBytes = sizeof(T) * num_q_heads * head_size_v;
-            void* qStepsPtr = nextWorkspacePtr(workspace_byte_ptr, offset, s_q * batch_beam * qRowBytes);
-            void* oStepsPtr = nextWorkspacePtr(workspace_byte_ptr, offset, s_q * batch_beam * oRowBytes);
-            int32_t* stepKvLensPtr = reinterpret_cast<int32_t*>(
-                nextWorkspacePtr(workspace_byte_ptr, offset, sizeof(int32_t) * s_q * batch_beam));
-
-            invokePackHelixMlaMicrosteps(qPtr, qStepsPtr, generation_params.spec_bl_tree_first_sparse_mask_offset_kv,
-                generation_params.spec_decoding_packed_mask, stepKvLensPtr, batch_beam, s_q, packedMaskSeqStride,
-                packedMaskBlockStride, validMaskBlocks, qRowBytes, stream);
-
-            Flash_fwd_mla_params stepFlashMlaParams = flashMlaParams;
-            stepFlashMlaParams.seqlen_q = ngroups;
-            stepFlashMlaParams.is_causal = false;
-            stepFlashMlaParams.q_batch_stride = head_size * params.head_num;
-            stepFlashMlaParams.o_batch_stride = num_q_heads * head_size_v;
-
-            Mla_metadata_params stepMlaMetaDataParams = mlaMetaDataParams;
-            auto const qStepsBytePtr = static_cast<int8_t*>(qStepsPtr);
-            auto const oStepsBytePtr = static_cast<int8_t*>(oStepsPtr);
-            for (int32_t step = 0; step < s_q; ++step)
-            {
-                stepFlashMlaParams.q_ptr = qStepsBytePtr + static_cast<size_t>(step) * batch_beam * qRowBytes;
-                stepFlashMlaParams.o_ptr = oStepsBytePtr + static_cast<size_t>(step) * batch_beam * oRowBytes;
-                stepFlashMlaParams.cu_seqlens_k = stepKvLensPtr + static_cast<size_t>(step) * batch_beam;
-                stepFlashMlaParams.softmax_lse_ptr
-                    = softmax_lse_ptr + static_cast<size_t>(step) * batch_beam * num_q_heads;
-                stepMlaMetaDataParams.seqlens_k_ptr = stepFlashMlaParams.cu_seqlens_k;
-                get_mla_metadata_func(stepMlaMetaDataParams, stream);
-                runFlashMla(stepFlashMlaParams);
-            }
-            invokeUnpackHelixFlashMlaMicrosteps(oStepsPtr, flashMlaParams.o_ptr, softmax_lse_ptr,
-                generation_params.softmax_stats, batch_beam, s_q, oRowBytes, num_q_heads, stream);
-        }
-        else
-        {
-            // metadata should only be init once per iter, to fix later
-            get_mla_metadata_func(mlaMetaDataParams, stream);
-            runFlashMla(flashMlaParams);
-            invokeConvertFlashMlaLseToHelixStats(
-                softmax_lse_ptr, generation_params.softmax_stats, batch_beam, s_q, num_q_heads, stream);
-        }
+        // metadata should only be init once per iter, to fix later
+        get_mla_metadata_func(mlaMetaDataParams, stream);
+        runFlashMla(flashMlaParams);
+        invokeConvertFlashMlaLseToHelixStats(
+            softmax_lse_ptr, generation_params.softmax_stats, batch_beam, s_q, num_q_heads, stream);
     }
     else
     {

@@ -2460,7 +2460,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _should_build_helix_spec_decoding_mask(self) -> bool:
         """Return whether Helix needs the packed custom mask metadata."""
-        return False
+        return not is_mla(self.model.model_config.pretrained_config)
 
     def _prepare_encoder_decoder_cross_attention_inputs(
         self,
@@ -2578,8 +2578,11 @@ class PyTorchModelEngine(ModelEngine):
         if self.spec_config is None:
             return False
 
-        # Not allowed for one-model speculative decoding
-        if not self.spec_config.spec_dec_mode.has_draft_model():
+        spec_dec_mode = self.spec_config.spec_dec_mode
+        has_draft_model = spec_dec_mode.has_draft_model()
+        is_helix_one_model_mtp = (self.mapping.has_cp_helix()
+                                  and spec_dec_mode.is_mtp_one_model())
+        if not has_draft_model and not is_helix_one_model_mtp:
             return False
 
         if not self.cuda_graph_runner.enabled:
