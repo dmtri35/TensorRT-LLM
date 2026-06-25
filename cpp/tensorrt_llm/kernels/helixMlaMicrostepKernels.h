@@ -28,17 +28,19 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-void invokePrepareHelixMlaMicrostep(void const* q, void* qStep, int32_t const* firstSparseOffsetsKv,
+void invokePackHelixMlaMicrosteps(void const* q, void* qSteps, int32_t const* firstSparseOffsetsKv,
     int32_t const* packedMask, int32_t* stepKvLens, int32_t batchSize, int32_t seqLenQ, int32_t packedMaskSeqStride,
-    int32_t packedMaskBlockStride, int32_t validMaskBlocks, int32_t step, size_t qRowBytes, cudaStream_t stream);
+    int32_t packedMaskBlockStride, int32_t validMaskBlocks, size_t qRowBytes, cudaStream_t stream);
 
-void invokeScatterHelixMlaMicrostep(void const* oStep, void* o, float2 const* softmaxStatsStep,
-    float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t step, size_t oRowBytes, int32_t numHeads,
-    cudaStream_t stream);
+void invokeUnpackHelixMlaMicrosteps(void const* oSteps, void* o, float2 const* softmaxStatsSteps,
+    float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, size_t oRowBytes, int32_t numHeads, cudaStream_t stream);
 
 void invokeConvertFlashMlaLseToHelixStats(
     float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads,
     cudaStream_t stream);
+
+void invokeUnpackHelixFlashMlaMicrosteps(void const* oSteps, void* o, float const* softmaxLseSteps,
+    float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, size_t oRowBytes, int32_t numHeads, cudaStream_t stream);
 
 } // namespace kernels
 
