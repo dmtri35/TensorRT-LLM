@@ -769,42 +769,53 @@ class MTPWorker(SpecWorkerBase):
             resource_manager)
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
-            for i, mtp_layer in enumerate(draft_model.mtp_layers):
-                if self.guided_decoder is not None:
-                    new_tokens = draft_inputs['input_ids'][last_tokens_idx]
-                    self.guided_decoder.add_draft_batch(new_tokens,
-                                                        num_accepted_tokens,
-                                                        draft_step=i)
-
-                self._helix_draft_owner_mask(attn_metadata,
-                                             draft_inputs["position_ids"],
-                                             attn_metadata.num_seqs)
-                hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
-                                          **draft_inputs)
-
-                logits = mtp_layer.shared_head(hidden_states,
-                                               draft_model.lm_head,
-                                               attn_metadata).float()
-                if self.guided_decoder is not None:
-                    self.guided_decoder.execute_draft_batch(logits,
+            mtp_index_share_enabled = self._set_mtp_index_reuse(
+                attn_metadata, False)
+            if mtp_index_share_enabled and hasattr(
+                    attn_metadata, "has_shared_dsa_topk_indices"):
+                attn_metadata.has_shared_dsa_topk_indices = False
+            try:
+                for i, mtp_layer in enumerate(draft_model.mtp_layers):
+                    self._set_mtp_index_reuse(attn_metadata, i > 0)
+                    if self.guided_decoder is not None:
+                        new_tokens = draft_inputs['input_ids'][last_tokens_idx]
+                        self.guided_decoder.add_draft_batch(new_tokens,
+                                                            num_accepted_tokens,
                                                             draft_step=i)
 
-                new_draft_token = self.draft_sampler(logits)
-                next_draft_tokens.append(new_draft_token)
-                # shift input_ids and hidden_states
-                input_ids = draft_inputs["input_ids"]
-                input_ids[:-1] = input_ids[1:].clone()
-                input_ids[last_tokens_idx] = new_draft_token
-                draft_hidden_states = draft_inputs["hidden_states"]
-                draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
-                draft_hidden_states[last_tokens_idx] = hidden_states[
-                    last_tokens_idx, :]
-                draft_inputs = {
-                    "input_ids": input_ids,
-                    "position_ids": draft_inputs["position_ids"],
-                    "hidden_states": draft_hidden_states,
-                    "attn_metadata": draft_inputs["attn_metadata"],
-                }
+                    self._helix_draft_owner_mask(attn_metadata,
+                                                 draft_inputs["position_ids"],
+                                                 attn_metadata.num_seqs)
+                    hidden_states = mtp_layer(
+                        embed_tokens=draft_model.embed_tokens, **draft_inputs)
+
+                    logits = mtp_layer.shared_head(hidden_states,
+                                                   draft_model.lm_head,
+                                                   attn_metadata).float()
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.execute_draft_batch(logits,
+                                                                draft_step=i)
+
+                    new_draft_token = self.draft_sampler(
+                        logits, draft_model.lm_head.mapping)
+                    next_draft_tokens.append(new_draft_token)
+                    # shift input_ids and hidden_states
+                    input_ids = draft_inputs["input_ids"]
+                    input_ids[:-1] = input_ids[1:].clone()
+                    input_ids[last_tokens_idx] = new_draft_token
+                    draft_hidden_states = draft_inputs["hidden_states"]
+                    draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
+                    draft_hidden_states[last_tokens_idx] = hidden_states[
+                        last_tokens_idx, :]
+                    draft_inputs = {
+                        "input_ids": input_ids,
+                        "position_ids": draft_inputs["position_ids"],
+                        "hidden_states": draft_hidden_states,
+                        "attn_metadata": draft_inputs["attn_metadata"],
+                    }
+            finally:
+                if mtp_index_share_enabled:
+                    _clear_shared_dsa_topk_indices(attn_metadata)
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # Override with SA draft tokens after all MTP layers have run,
@@ -1474,26 +1485,27 @@ class MTPWorker(SpecWorkerBase):
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size
-                > 1) and not (self.model_config.mapping.enable_attention_dp):
-            combined = self.get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
+        sampler_mapping = mapping_lm_head_tp
+        if sampler_mapping is None and self.model_config is not None and hasattr(
+                self.model_config, 'mapping'):
+            sampler_mapping = self.model_config.mapping
+
+        if (sampler_mapping is not None and sampler_mapping.tp_size > 1
+                and not sampler_mapping.enable_attention_dp):
+            combined = self.get_local_max_and_combined(logits, sampler_mapping)
+            gathered = allgather(combined, sampler_mapping, dim=-1)
             draft_tokens = self.get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size
-              > 1) and self.model_config.mapping.enable_lm_head_tp_in_adp:
+        elif (sampler_mapping is not None and sampler_mapping.tp_size > 1
+              and sampler_mapping.enable_lm_head_tp_in_adp):
             # For ADP + LM head TP mode, we need to find the global argmax across all TP ranks
             combined = self.get_local_max_and_combined(logits,
-                                                       mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+                                                       sampler_mapping)
+            gathered = allgather(combined, sampler_mapping, dim=-1)
             batch_size = logits.shape[0]
-            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
-            gathered = gathered.view(mapping_lm_head_tp.tp_size,
+            local_batch_size = batch_size // sampler_mapping.tp_size
+            gathered = gathered.view(sampler_mapping.tp_size,
                                      local_batch_size, -1)
-            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
+            sliced_gathered = gathered[sampler_mapping.tp_rank]
             draft_tokens = self.get_draft_tokens_from_gathered(sliced_gathered)
         else:
             # Simple argmax if no TP or no model config

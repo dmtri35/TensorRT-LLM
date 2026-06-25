@@ -16,6 +16,7 @@
  */
 #include "tensorrt_llm/kernels/helixMlaMicrostepKernels.h"
 
+#include <cmath>
 #include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
@@ -82,6 +83,27 @@ __global__ void scatterHelixMlaMicrostepKernel(uint8_t const* oStep, uint8_t* o,
     }
 }
 
+__global__ void convertFlashMlaLseToHelixStatsKernel(
+    float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads)
+{
+    int32_t const totalStats = batchSize * seqLenQ * numHeads;
+    for (int32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < totalStats; idx += blockDim.x * gridDim.x)
+    {
+        float const lse = softmaxLse[idx];
+        if (!isfinite(lse))
+        {
+            softmaxStats[idx] = make_float2(-INFINITY, 0.0F);
+        }
+        else
+        {
+            // Helix combines normalized partial outputs using sum * exp(max - global_max).
+            // FlashMLA exposes log(sum(exp(scores))) for each row, so encode it as
+            // max=logZ and sum=1 to produce the same correction factor.
+            softmaxStats[idx] = make_float2(lse, 1.0F);
+        }
+    }
+}
+
 } // namespace
 
 void invokePrepareHelixMlaMicrostep(void const* q, void* qStep, int32_t const* firstSparseOffsetsKv,
@@ -101,6 +123,22 @@ void invokeScatterHelixMlaMicrostep(void const* oStep, void* o, float2 const* so
     static constexpr int kThreadsPerBlock = 256;
     scatterHelixMlaMicrostepKernel<<<batchSize, kThreadsPerBlock, 0, stream>>>(static_cast<uint8_t const*>(oStep),
         static_cast<uint8_t*>(o), softmaxStatsStep, softmaxStats, batchSize, seqLenQ, step, oRowBytes, numHeads);
+}
+
+void invokeConvertFlashMlaLseToHelixStats(
+    float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads,
+    cudaStream_t stream)
+{
+    if (softmaxLse == nullptr || softmaxStats == nullptr)
+    {
+        return;
+    }
+
+    static constexpr int kThreadsPerBlock = 256;
+    int32_t const totalStats = batchSize * seqLenQ * numHeads;
+    int32_t const numBlocks = (totalStats + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    convertFlashMlaLseToHelixStatsKernel<<<numBlocks, kThreadsPerBlock, 0, stream>>>(
+        softmaxLse, softmaxStats, batchSize, seqLenQ, numHeads);
 }
 
 } // namespace kernels

@@ -970,9 +970,12 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
         workspaces[1] = mIsGenerationMLA ? 0 : cu_seqlens_size; // cu_kv_len
         workspaces[2] = mIsGenerationMLA ? 0 : fmha_scheduler_counter;
         workspaces[3] = fmha_multi_ctas_kv_scratch_size;
-        workspaces[4] = tc::getEnvHelixMlaMtpMicrostep()
+        bool const needsHelixMlaMicrostepWorkspace = mIsSpecDecodingEnabled
+            && mMLAParams.predicted_tokens_per_seq > 1 && (tc::getEnvHelixMlaMtpMicrostep() || mUseGenFlashMLA);
+        int32_t const helixMlaMicrostepNumHeads = std::max(mNumAttnHeads, mNumHeads);
+        workspaces[4] = needsHelixMlaMicrostepWorkspace
             ? getHelixMlaMicrostepWorkspaceSize(
-                mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : size, size, batch_beam, mNumAttnHeads, headDim,
+                mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : size, size, batch_beam, helixMlaMicrostepNumHeads, headDim,
                 mMLAParams.kv_lora_rank)
             : 0;
         workspaces[5] = flash_mla_workspace_size;
@@ -1113,10 +1116,12 @@ int AttentionOp::mlaGeneration(
         // shrinking each token's effective KV length.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-        tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
-        // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
+        bool const useMultiCtasKvMode = mMultiBlockMode || generation_params.softmax_stats != nullptr;
+        tllmRunnerParams.mMultiCtasKvMode = useMultiCtasKvMode;
+        // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode
+        // or when Helix needs the reduction path to return softmax stats.
         // Otherwise, always enable the persistent scheduler for better performance.
-        tllmRunnerParams.mTileScheduler = mMultiBlockMode ? TileScheduler::Static : TileScheduler::Persistent;
+        tllmRunnerParams.mTileScheduler = useMultiCtasKvMode ? TileScheduler::Static : TileScheduler::Persistent;
 
         // Q buffer.
         tllmRunnerParams.qPtr = mFP8GenerationMLA ? reinterpret_cast<void const*>(params.quant_q_buf)
@@ -1339,8 +1344,9 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.scale_softmax = softmax_scale;
         flashMlaParams.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
 
-        flashMlaParams.q_ptr = mFP8GenerationMLA ? const_cast<void*>(reinterpret_cast<void const*>(params.quant_q_buf))
-                                                 : const_cast<void*>(reinterpret_cast<void const*>(params.q_buf));
+        void const* qPtr = mFP8GenerationMLA ? reinterpret_cast<void const*>(params.quant_q_buf)
+                                             : reinterpret_cast<void const*>(params.q_buf);
+        flashMlaParams.q_ptr = const_cast<void*>(qPtr);
         flashMlaParams.k_ptr = kv_cache_buffer.mPrimaryPoolPtr;
         flashMlaParams.v_ptr = flashMlaParams.k_ptr;
         flashMlaParams.o_ptr = reinterpret_cast<void*>(params.context_buf);
@@ -1375,31 +1381,94 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.softmax_lseaccum_ptr = softmax_lse_accum_ptr;
         flashMlaParams.oaccum_ptr = out_accum_ptr;
 
-        if constexpr (std::is_same<T, half>::value)
+        auto runFlashMla = [&](Flash_fwd_mla_params& runParams)
         {
-            if (mFP8GenerationMLA)
+            if constexpr (std::is_same<T, half>::value)
             {
-                TLLM_THROW("FP8 KV cache MLA is only supported for bf16 output");
+                if (mFP8GenerationMLA)
+                {
+                    TLLM_THROW("FP8 KV cache MLA is only supported for bf16 output");
+                }
+                else
+                {
+                    run_mha_fwd_splitkv_mla<cutlass::half_t, cutlass::half_t, 576>(runParams, stream);
+                }
+            }
+            else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+            {
+                if (mFP8GenerationMLA)
+                {
+                    run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(runParams, stream);
+                }
+                else
+                {
+                    run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, cutlass::bfloat16_t, 576>(runParams, stream);
+                }
             }
             else
             {
-                run_mha_fwd_splitkv_mla<cutlass::half_t, cutlass::half_t, 576>(flashMlaParams, stream);
+                TLLM_THROW("Unsupported data type for FlashMLA");
             }
-        }
-        else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+        };
+
+        bool const useHelixFlashMlaMtpMicrostep = mIsSpecDecodingEnabled && mUseSpecDecoding && s_q > 1
+            && params.helix_is_inactive_rank != nullptr && params.helix_is_inactive_rank_per_token;
+        if (useHelixFlashMlaMtpMicrostep)
         {
-            if (mFP8GenerationMLA)
+            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_packed_mask != nullptr,
+                "Helix FlashMLA MTP microstep requires spec_decoding_packed_mask.");
+            TLLM_CHECK_WITH_INFO(generation_params.spec_bl_tree_first_sparse_mask_offset_kv != nullptr,
+                "Helix FlashMLA MTP microstep requires spec_bl_tree_first_sparse_mask_offset_kv.");
+            TLLM_CHECK_WITH_INFO(generation_params.spec_decoding_max_generation_length >= s_q,
+                "Helix FlashMLA MTP microstep metadata is shorter than the query sequence.");
+            TLLM_CHECK_WITH_INFO(generation_params.softmax_stats != nullptr,
+                "Helix FlashMLA MTP microstep requires softmax stats for Helix reduction.");
+
+            int32_t const packedMaskSeqStride = generation_params.spec_decoding_max_generation_length;
+            int32_t const packedMaskBlockStride = tc::divUp(packedMaskSeqStride, 32);
+            int32_t const validMaskBlocks = tc::divUp(s_q, 32);
+            auto const qElemSize = mFP8GenerationMLA ? sizeof(__nv_fp8_e4m3) : sizeof(T);
+            size_t const qRowBytes = qElemSize * params.head_num * head_size;
+            size_t const oRowBytes = sizeof(T) * num_q_heads * head_size_v;
+            void* qStepPtr = nextWorkspacePtr(workspace_byte_ptr, offset, batch_beam * qRowBytes);
+            void* oStepPtr = nextWorkspacePtr(workspace_byte_ptr, offset, batch_beam * oRowBytes);
+            float2* softmaxStatsStepPtr = reinterpret_cast<float2*>(
+                nextWorkspacePtr(workspace_byte_ptr, offset, sizeof(float2) * batch_beam * num_q_heads));
+            int32_t* stepKvLensPtr = reinterpret_cast<int32_t*>(
+                nextWorkspacePtr(workspace_byte_ptr, offset, sizeof(int32_t) * batch_beam));
+
+            Flash_fwd_mla_params stepFlashMlaParams = flashMlaParams;
+            stepFlashMlaParams.q_ptr = qStepPtr;
+            stepFlashMlaParams.o_ptr = oStepPtr;
+            stepFlashMlaParams.cu_seqlens_k = stepKvLensPtr;
+            stepFlashMlaParams.seqlen_q = ngroups;
+            stepFlashMlaParams.is_causal = false;
+            stepFlashMlaParams.q_batch_stride = head_size * params.head_num;
+            stepFlashMlaParams.o_batch_stride = num_q_heads * head_size_v;
+
+            Mla_metadata_params stepMlaMetaDataParams = mlaMetaDataParams;
+            stepMlaMetaDataParams.seqlens_k_ptr = stepKvLensPtr;
+            for (int32_t step = 0; step < s_q; ++step)
             {
-                run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(flashMlaParams, stream);
-            }
-            else
-            {
-                run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+                invokePrepareHelixMlaMicrostep(qPtr, qStepPtr,
+                    generation_params.spec_bl_tree_first_sparse_mask_offset_kv,
+                    generation_params.spec_decoding_packed_mask, stepKvLensPtr, batch_beam, s_q, packedMaskSeqStride,
+                    packedMaskBlockStride, validMaskBlocks, step, qRowBytes, stream);
+                get_mla_metadata_func(stepMlaMetaDataParams, stream);
+                runFlashMla(stepFlashMlaParams);
+                invokeConvertFlashMlaLseToHelixStats(
+                    softmax_lse_ptr, softmaxStatsStepPtr, batch_beam, 1, num_q_heads, stream);
+                invokeScatterHelixMlaMicrostep(oStepPtr, flashMlaParams.o_ptr, softmaxStatsStepPtr,
+                    generation_params.softmax_stats, batch_beam, s_q, step, oRowBytes, num_q_heads, stream);
             }
         }
         else
         {
-            TLLM_THROW("Unsupported data type for FlashMLA");
+            // metadata should only be init once per iter, to fix later
+            get_mla_metadata_func(mlaMetaDataParams, stream);
+            runFlashMla(flashMlaParams);
+            invokeConvertFlashMlaLseToHelixStats(
+                softmax_lse_ptr, generation_params.softmax_stats, batch_beam, s_q, num_q_heads, stream);
         }
     }
     else
@@ -1455,6 +1524,7 @@ int AttentionOp::mlaGeneration(
         fmhaParams.scaleBmm2Ptr = reinterpret_cast<float const*>(params.bmm2_scale);
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
+        fmhaParams.softmaxStatsPtr = generation_params.softmax_stats;
 
         // Sparse attention parameters
         if (useSparseMLA())

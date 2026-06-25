@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2020-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2020-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -1005,7 +1005,7 @@ void {launcher_name}_nl_tiled(
     cudaStream_t stream){{
   // runtime q_loop_iters
   using Cta_tile_o = typename Kernel_traits_nl_tiled::Cta_tile_o;
-  int ctas_per_o_row = (params.d + Cta_tile_o::N - 1) / Cta_tile_o::N;
+  int ctas_per_o_row = (Cta_tile_o::VALID_N + Cta_tile_o::N - 1) / Cta_tile_o::N;
   int loop_iters = ( params.s + {noloop_step} - 1 )  / {noloop_step};
   dim3 grid(loop_iters * ctas_per_o_row, params.h, params.b);
   constexpr int smem_size = Kernel_traits_nl_tiled::BYTES_PER_SMEM;

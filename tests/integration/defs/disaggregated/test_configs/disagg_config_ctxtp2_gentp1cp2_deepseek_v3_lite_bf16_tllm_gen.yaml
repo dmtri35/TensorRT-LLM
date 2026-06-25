@@ -9,7 +9,7 @@ context_servers:
   kv_cache_config:
     enable_block_reuse: false
     enable_partial_reuse: false
-    tokens_per_block: 32
+    tokens_per_block: 64
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
@@ -22,10 +22,10 @@ generation_servers:
   enable_chunked_prefill: false
   cp_config:
     cp_type: HELIX
-    tokens_per_block: 32
+    tokens_per_block: 64
   kv_cache_config:
     enable_block_reuse: false
     enable_partial_reuse: false
-    tokens_per_block: 32
+    tokens_per_block: 64
   cache_transceiver_config:
     backend: UCX

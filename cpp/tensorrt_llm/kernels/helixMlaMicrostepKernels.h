@@ -36,6 +36,10 @@ void invokeScatterHelixMlaMicrostep(void const* oStep, void* o, float2 const* so
     float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t step, size_t oRowBytes, int32_t numHeads,
     cudaStream_t stream);
 
+void invokeConvertFlashMlaLseToHelixStats(
+    float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads,
+    cudaStream_t stream);
+
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END
