@@ -2265,6 +2265,17 @@ class PyTorchModelEngine(ModelEngine):
                                            accepted_owner.to(torch.int32))
         kv_lens_delta = accepted_owned_counts + new_owned_counts - old_owned_counts
 
+        helix_zero_kv_mask = getattr(attn_metadata, 'helix_zero_kv_mask', None)
+        kv_lens_cuda = getattr(attn_metadata, 'kv_lens_cuda', None)
+        if helix_zero_kv_mask is not None and kv_lens_cuda is not None:
+            kv_lens = kv_lens_cuda[num_ctx_requests:attn_metadata.num_seqs].to(
+                device=device, dtype=kv_lens_delta.dtype)
+            target_kv_lens_delta = -kv_lens_delta if restore else kv_lens_delta
+            target_kv_lens = kv_lens + target_kv_lens_delta
+            zero_kv_mask = target_kv_lens[seq_ids_local] == 0
+            helix_zero_kv_mask[token_start:token_end].copy_(
+                zero_kv_mask.to(device=helix_zero_kv_mask.device))
+
         if restore:
             attn_metadata.helix_position_offsets[token_start:token_end].copy_(
                 old_positions.to(torch.int32))
@@ -2570,7 +2581,8 @@ class PyTorchModelEngine(ModelEngine):
     def _can_use_incremental_update(
             self, scheduled_requests: ScheduledRequests,
             new_tokens_device: Optional[torch.Tensor],
-            next_draft_tokens_device: Optional[torch.Tensor]) -> bool:
+            next_draft_tokens_device: Optional[torch.Tensor],
+            num_accepted_tokens_device: Optional[torch.Tensor] = None) -> bool:
         """
         Check if we can use incremental update for the given scheduled requests and new tensors device.
         """
@@ -2583,6 +2595,8 @@ class PyTorchModelEngine(ModelEngine):
         is_helix_one_model_mtp = (self.mapping.has_cp_helix()
                                   and spec_dec_mode.is_mtp_one_model())
         if not has_draft_model and not is_helix_one_model_mtp:
+            return False
+        if is_helix_one_model_mtp and num_accepted_tokens_device is None:
             return False
 
         if not self.cuda_graph_runner.enabled:
@@ -3139,9 +3153,11 @@ class PyTorchModelEngine(ModelEngine):
                 new_tokens=new_tokens_device,
                 runtime_draft_len=self.runtime_draft_len)
 
-        if self._can_use_incremental_update(scheduled_requests,
-                                            new_tokens_device,
-                                            next_draft_tokens_device):
+        if self._can_use_incremental_update(
+                scheduled_requests,
+                new_tokens_device,
+                next_draft_tokens_device,
+                num_accepted_tokens_device=num_accepted_tokens_device):
             return self._apply_incremental_update(
                 scheduled_requests, kv_cache_manager, attn_metadata,
                 spec_metadata, new_tensors_device, cache_indirection_buffer,

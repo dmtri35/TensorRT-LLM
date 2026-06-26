@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from types import SimpleNamespace
+
 import torch
 
 from tensorrt_llm._torch.pyexecutor import model_engine
+from tensorrt_llm._torch.pyexecutor.llm_request import \
+    get_spec_decode_token_counts
 from tensorrt_llm._torch.speculative.mtp import MTPWorker
 
 
@@ -141,6 +145,51 @@ def test_helix_draft_owner_mask_uses_current_position_count():
                        torch.tensor([100, 101, 200], dtype=torch.int))
     assert torch.equal(metadata.helix_is_inactive_rank[:3],
                        torch.tensor([False, False, False]))
+
+
+def test_helix_accepted_owner_counts_excludes_rejected_rows():
+    worker = object.__new__(MTPWorker)
+    metadata = _HelixMetadata()
+    metadata.num_tokens = 8
+    metadata.seq_lens_cuda = torch.tensor([4, 4], dtype=torch.int)
+    metadata.helix_is_inactive_rank = torch.tensor(
+        [False, False, True, True, True, False, False, True],
+        dtype=torch.bool)
+
+    accepted_owner_counts = worker._helix_accepted_owner_counts(
+        metadata, torch.tensor([1, 3], dtype=torch.int), batch_size=2)
+
+    assert torch.equal(accepted_owner_counts,
+                       torch.tensor([1, 2], dtype=torch.int32))
+
+
+def test_helix_first_draft_kv_lens_delta_rewinds_generation_rows():
+    worker = object.__new__(MTPWorker)
+    metadata = _HelixMetadata()
+    metadata.num_contexts = 1
+    metadata.num_tokens = 8
+    metadata.seq_lens_cuda = torch.tensor([4, 4], dtype=torch.int)
+    metadata.helix_is_inactive_rank = torch.tensor(
+        [False, False, False, False, True, False, False, True],
+        dtype=torch.bool)
+    owner_counts = torch.tensor([4, 2], dtype=torch.int32)
+
+    kv_lens_delta = worker._helix_first_draft_kv_lens_delta(
+        metadata,
+        torch.tensor([1, 1], dtype=torch.int),
+        owner_counts,
+        batch_size=2)
+
+    assert torch.equal(kv_lens_delta, torch.tensor([1, -1], dtype=torch.int32))
+
+
+def test_spec_decode_token_counts_use_rewind_for_attempts():
+    request = SimpleNamespace(num_draft_tokens=1,
+                              py_draft_tokens=[10, 11, 12],
+                              py_num_accepted_draft_tokens=2,
+                              py_rewind_len=1)
+
+    assert get_spec_decode_token_counts(request) == (3, 2)
 
 
 def test_helix_verify_token_params_first_generation_token():

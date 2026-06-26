@@ -213,6 +213,7 @@ class GenerationResultBase:
         self._context_logits: Optional[torch.Tensor] = None
         # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
         self.time_breakdown_metrics: Optional[Dict] = None
+        self.spec_decode_stats: Optional[Dict] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -377,6 +378,10 @@ class GenerationResultBase:
         if hasattr(response_tensors, 'time_breakdown_metrics'
                    ) and response_tensors.time_breakdown_metrics is not None:
             self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
+
+        if hasattr(response_tensors,
+                   'spec_decode_stats') and response_tensors.spec_decode_stats is not None:
+            self.spec_decode_stats = response_tensors.spec_decode_stats
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times

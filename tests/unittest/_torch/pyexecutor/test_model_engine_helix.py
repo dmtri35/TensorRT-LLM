@@ -18,6 +18,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import (
     PyTorchModelEngine,
     _get_num_tokens_after_helix_cp,
 )
+from tensorrt_llm._torch.speculative.mtp import MTPEagleWorker
 
 
 class _Mapping:
@@ -39,6 +40,63 @@ class _Request:
         self.py_helix_global_decode_len = py_helix_global_decode_len
 
 
+class _SpecDecMode:
+
+    def has_draft_model(self):
+        return False
+
+    def is_mtp_one_model(self):
+        return True
+
+
+class _SpecConfig:
+    spec_dec_mode = _SpecDecMode()
+
+
+class _CudaGraphRunner:
+    enabled = True
+
+
+class _GenerationRequest:
+
+    def __init__(self, request_id: int):
+        self.py_request_id = request_id
+
+
+class _ScheduledRequests:
+    num_context_requests = 0
+
+    def __init__(self, request_ids):
+        self.generation_requests = [
+            _GenerationRequest(request_id) for request_id in request_ids
+        ]
+
+
+class _ModelConfig:
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+
+
+class _MTPEagleWorker:
+
+    def __init__(self, mapping):
+        self.model_config = _ModelConfig(mapping)
+
+
+class _HelixDraftMetadata:
+
+    def __init__(self):
+        self.num_tokens = 8
+        self.num_contexts = 0
+        self.seq_lens_cuda = torch.tensor([4, 4], dtype=torch.int64)
+        self.helix_total_input_len = torch.tensor([0, 0], dtype=torch.int64)
+        self.tokens_per_block = 1
+        self.helix_position_offsets = torch.zeros(8, dtype=torch.int32)
+        self.helix_is_inactive_rank = torch.ones(8, dtype=torch.bool)
+        self.helix_zero_kv_mask = None
+
+
 def test_get_num_tokens_after_helix_cp_localizes_token_count():
     assert _get_num_tokens_after_helix_cp(96, _Mapping(True)) == 24
     assert _get_num_tokens_after_helix_cp(65, _Mapping(True)) == 17
@@ -46,6 +104,49 @@ def test_get_num_tokens_after_helix_cp_localizes_token_count():
 
 def test_get_num_tokens_after_helix_cp_preserves_token_count_without_helix():
     assert _get_num_tokens_after_helix_cp(96, _Mapping(False)) == 96
+
+
+def test_helix_mtp_owner_mask_uses_first_draft_sequence_lengths():
+    worker = _MTPEagleWorker(_Mapping(True, cp_rank=0, cp_size=4))
+    metadata = _HelixDraftMetadata()
+    position_ids = torch.tensor([0, 1, 2, 4, 5, 6], dtype=torch.int64)
+
+    owner_counts = MTPEagleWorker._helix_draft_owner_mask(
+        worker, metadata, position_ids, batch_size=2)
+
+    assert torch.equal(owner_counts, torch.tensor([1, 1], dtype=torch.int32))
+    assert torch.equal(metadata.helix_position_offsets[:6],
+                       position_ids.to(torch.int32))
+    assert torch.equal(
+        metadata.helix_is_inactive_rank[:6],
+        torch.tensor([False, True, True, False, True, True]))
+
+
+def test_helix_mtp_incremental_update_requires_accepted_tokens_tensor():
+    engine = object.__new__(PyTorchModelEngine)
+    engine.spec_config = _SpecConfig()
+    engine.mapping = _Mapping(True)
+    engine.cuda_graph_runner = _CudaGraphRunner()
+    engine.use_mrope = False
+    engine.previous_request_ids = [123]
+    engine.is_draft_model = False
+    engine.model_is_wrapped = False
+    engine.has_previous_device_draft = True
+
+    scheduled_requests = _ScheduledRequests([123])
+    new_tokens = torch.tensor([[1, 2, 3, 4]])
+    next_draft_tokens = torch.tensor([[2, 3, 4]])
+
+    assert not engine._can_use_incremental_update(
+        scheduled_requests,
+        new_tokens_device=new_tokens,
+        next_draft_tokens_device=next_draft_tokens,
+        num_accepted_tokens_device=None)
+    assert engine._can_use_incremental_update(
+        scheduled_requests,
+        new_tokens_device=new_tokens,
+        next_draft_tokens_device=next_draft_tokens,
+        num_accepted_tokens_device=torch.tensor([1]))
 
 
 def test_helix_verify_token_params_starts_at_unsettled_decode_index():
@@ -156,6 +257,55 @@ def test_helix_overlap_updates_kernel_position_offsets():
     assert torch.equal(metadata.helix_is_inactive_rank,
                        torch.tensor([False, False, False, True, True]))
     assert torch.equal(metadata.kv_lens_cuda, torch.tensor([2, 11]))
+
+
+def test_helix_overlap_updates_zero_kv_mask():
+    engine = object.__new__(PyTorchModelEngine)
+    engine.mapping = _Mapping(True, cp_rank=0, cp_size=2)
+    engine.enable_spec_decode = True
+    engine._disable_overlap_scheduler = False
+    engine.guided_decoder = None
+    engine.previous_pos_id_offsets_cuda = torch.tensor([2, 2],
+                                                       dtype=torch.int)
+    engine.previous_kv_lens_offsets_cuda = torch.tensor([-99],
+                                                        dtype=torch.int)
+
+    metadata = _AttentionMetadata()
+    metadata.num_tokens = 4
+    metadata.seq_lens_cuda = torch.tensor([2, 2], dtype=torch.int)
+    metadata.helix_position_offsets = torch.tensor([0, 1, 102, 103],
+                                                   dtype=torch.int)
+    metadata.helix_total_input_len = torch.tensor([0, 100], dtype=torch.int)
+    metadata.helix_is_inactive_rank = torch.tensor(
+        [False, False, True, True], dtype=torch.bool)
+    metadata.helix_zero_kv_mask = torch.tensor([False, False, True, True],
+                                               dtype=torch.bool)
+    metadata.kv_lens_cuda = torch.tensor([2, 0], dtype=torch.int)
+    inputs = {
+        'attn_metadata': metadata,
+        'input_ids': torch.tensor([1, 2, 3, 4], dtype=torch.int),
+        'position_ids': torch.tensor([[0, 1, 102, 103]], dtype=torch.int),
+    }
+
+    engine._preprocess_inputs(inputs)
+
+    assert torch.equal(inputs['position_ids'],
+                       torch.tensor([[0, 1, 104, 105]], dtype=torch.int))
+    assert torch.equal(metadata.helix_is_inactive_rank,
+                       torch.tensor([False, False, False, False]))
+    assert torch.equal(metadata.kv_lens_cuda, torch.tensor([2, 2]))
+    assert torch.equal(metadata.helix_zero_kv_mask,
+                       torch.tensor([False, False, False, False]))
+
+    engine._postprocess_inputs(inputs)
+
+    assert torch.equal(inputs['position_ids'],
+                       torch.tensor([[0, 1, 102, 103]], dtype=torch.int))
+    assert torch.equal(metadata.helix_is_inactive_rank,
+                       torch.tensor([False, False, True, True]))
+    assert torch.equal(metadata.kv_lens_cuda, torch.tensor([2, 0]))
+    assert torch.equal(metadata.helix_zero_kv_mask,
+                       torch.tensor([False, False, True, True]))
 
 
 def test_helix_overlap_ignores_padded_input_rows():

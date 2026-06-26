@@ -69,7 +69,8 @@ from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ATTENTION_DP_DUMMY_REQUEST_ID,
                           MAX_SPEC_DECODE_POSITIONS, ExecutorRequest,
                           LlmRequest, LlmRequestState, LlmResponse,
-                          get_draft_token_length)
+                          get_draft_token_length,
+                          get_spec_decode_token_counts)
 from .mamba_cache_manager import (BaseMambaCacheManager,
                                   MixedMambaHybridCacheManager)
 from .model_engine import ModelEngine
@@ -1454,6 +1455,17 @@ class PyExecutor:
 
         return req_stats
 
+    @staticmethod
+    def _accumulate_request_spec_decode_stats(
+        generation_requests: List[LlmRequest],
+    ) -> None:
+        for req in generation_requests:
+            draft_len, accepted_tokens = get_spec_decode_token_counts(req)
+            if draft_len <= 0:
+                continue
+            req.py_total_spec_decode_num_draft_tokens += draft_len
+            req.py_total_spec_decode_num_accepted_tokens += accepted_tokens
+
     def _update_iter_stats(
         self,
         stats,
@@ -1556,19 +1568,9 @@ class PyExecutor:
 
             # Aggregate stats from all generation requests
             for req in scheduled_batch.generation_requests:
-                draft_len = getattr(req, 'num_draft_tokens', 0)
-                py_draft_tokens = getattr(req, 'py_draft_tokens', None)
-                py_num_accepted = getattr(req, 'py_num_accepted_draft_tokens',
-                                          None)
-
-                # Use py_draft_tokens length if num_draft_tokens is 0
-                if draft_len == 0 and py_draft_tokens is not None:
-                    # Count non-zero draft tokens
-                    draft_len = sum(1 for t in py_draft_tokens if t != 0)
-
+                draft_len, accepted_tokens = get_spec_decode_token_counts(req)
                 if draft_len > 0:
                     total_draft_tokens += draft_len
-                    accepted_tokens = py_num_accepted if py_num_accepted is not None else 0
                     total_accepted_tokens += accepted_tokens
                     num_requests_with_draft += 1
 
@@ -2431,6 +2433,8 @@ class PyExecutor:
                 self._update_requests(executed_batch.sample_state)
 
                 scheduled_requests = executed_batch.scheduled_requests
+                self._accumulate_request_spec_decode_stats(
+                    scheduled_requests.generation_requests)
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -3084,6 +3088,8 @@ class PyExecutor:
 
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state, self.resource_manager)
+                    self._accumulate_request_spec_decode_stats(
+                        scheduled_batch.generation_requests)
 
                     self._send_kv_async(scheduled_batch.all_requests())
                     self._flush_pending_transfer_responses()
@@ -3474,6 +3480,9 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
+                    self._accumulate_request_spec_decode_stats(
+                        self.previous_batch.scheduled_requests.
+                        generation_requests)
 
                     self._send_kv_async(
                         self.previous_batch.scheduled_requests.all_requests())
