@@ -1237,8 +1237,6 @@ int AttentionOp::mlaGeneration(
         int* tile_scheduler_metadata_ptr = const_cast<int*>(params.flash_mla_tile_scheduler_metadata);
         int* num_splits_ptr = const_cast<int*>(params.flash_mla_num_splits);
 
-        get_mla_metadata_func(mlaMetaDataParams, stream);
-
         Flash_fwd_mla_params flashMlaParams{};
         flashMlaParams.b = batch_beam;
         flashMlaParams.seqlen_q = ngroups * s_q;
