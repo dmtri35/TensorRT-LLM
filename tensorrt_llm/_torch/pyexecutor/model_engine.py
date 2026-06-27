@@ -2471,7 +2471,7 @@ class PyTorchModelEngine(ModelEngine):
 
     def _should_build_helix_spec_decoding_mask(self) -> bool:
         """Return whether Helix needs the packed custom mask metadata."""
-        return not is_mla(self.model.model_config.pretrained_config)
+        return False
 
     def _prepare_encoder_decoder_cross_attention_inputs(
         self,

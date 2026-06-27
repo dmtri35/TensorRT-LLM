@@ -863,10 +863,7 @@ public:
                 /*recvSideHasCP=*/false, srcPpSize);
 
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            // A Helix CP "empty" rank owns zero KV blocks for this sequence (fewer blocks than
-            // cp_size). It still sends a RequestInfo so the context's per-request counterpart count
-            // is satisfied, but requests zero blocks: the default RequestInfo (indexFromEnd=0, empty
-            // lastBlockKey) is used and the context transmits nothing to it.
+            // Helix CP empty ranks still send RequestInfo, but request no blocks.
             if (requestedBlockSize > 0)
             {
                 auto const beam = 0;

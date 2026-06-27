@@ -74,8 +74,7 @@ void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
     size_t bufferIdx = computeBufferIdx(localIdx, targetInfo);
     size_t size = outputBuffers[bufferIdx]->getSizeInBytes();
 
-    // Helix: skip CP ranks that own no blocks for this sequence (num_total_blocks < cp_size).
-    // The matching gen rank skips its receive, so no 0-byte transfer is posted on either side.
+    // Helix CP empty ranks do not post a matching receive.
     if (size == 0)
     {
         return;
@@ -176,6 +175,16 @@ void sendAllBuffers(TransferSession& session, int deviceId,
     {
         sendBuffer(session, deviceId, 0, outputBuffers, bufferCoverTargetNum, preAllocSendBuffer, bufferManager,
             targetInfo, pickUpConnections);
+    }
+}
+
+void releasePreAssignedRecvBuffer(
+    executor::kv_cache::Connection const* connection, BaseTransBufferManager* manager, BufferKind kind)
+{
+    auto preAssignedId = connection->getPreAssignedBufferId(static_cast<uint8_t>(kind));
+    if (preAssignedId.has_value())
+    {
+        manager->freeBufferIndexForRecv(static_cast<int>(*preAssignedId));
     }
 }
 } // namespace tensorrt_llm::batch_manager
@@ -483,6 +492,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         if (inputKvCacheBlocksPerWindow.size() > 1)
         {
+            TLLM_CHECK_WITH_INFO(selfConfig.getParallelConfig().mContextParallelism == 1
+                    && destConfig.getParallelConfig().mContextParallelism == 1,
+                "Variable-window KV cache transfer with context parallelism is not supported");
             if (selfConfig.getParallelConfig().mPipelineParallelism
                 != destConfig.getParallelConfig().mPipelineParallelism)
             {
@@ -694,14 +706,17 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         kvWindowSizes.size());
     TLLM_CHECK(!outputBuffersPerWindow.empty());
 
-    // Helix: an "empty" CP rank owns no KV blocks for this sequence (num_total_blocks < cp_size).
-    // There is nothing to receive; the sender (context, CP=1) skips the matching 0-byte transfer.
+    // Helix CP empty rank: no KV blocks to receive.
     if (blockNum == 0)
     {
+        releasePreAssignedRecvBuffer(connections[pickUpConnections[0]], mCacheTransBufferManager, BufferKind::kKV);
         return;
     }
     if (outputBuffersPerWindow.size() > 1)
     {
+        TLLM_CHECK_WITH_INFO(selfConfig.getParallelConfig().mContextParallelism == 1
+                && destConfig.getParallelConfig().mContextParallelism == 1,
+            "Variable-window KV cache transfer with context parallelism is not supported");
         // We only support limited case for VSWA.
         if (selfConfig.getParallelConfig().mPipelineParallelism != destConfig.getParallelConfig().mPipelineParallelism)
         {

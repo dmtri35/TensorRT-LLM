@@ -295,10 +295,6 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_llama4_kv_cache_overflow.yaml",
         "deepseek_v3_lite_bf16_tllm_gen_helix":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen.yaml",
-        "deepseek_v3_lite_bf16_tp2_one_mtp":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_bf16_one_mtp.yaml",
-        "deepseek_v3_lite_bf16_tllm_gen_helix_one_mtp":
-        f"{test_configs_root}/disagg_config_ctxtp2_gentp1cp2_deepseek_v3_lite_bf16_tllm_gen_one_mtp.yaml",
         "deepseek_r1_v2_fp4_stress":
         f"{test_configs_root}/disagg_config_ctxtp4_gentp4_deepseek_r1_v2_fp4_tllm.yaml",
         "deepseek_r1_v2_fp4_mtp_stress":
@@ -755,8 +751,6 @@ def run_disaggregated_test(example_dir,
                            extra_endpoints_test=None,
                            model_path=None,
                            cwd=None,
-                           disagg_schedule_style=None,
-                           post_client_test=None,
                            server_start_timeout=300):
     """Run disaggregated test using service discovery instead of MPI."""
     if mpi_disabled():
@@ -771,7 +765,6 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             schedule_style=disagg_schedule_style,
                              server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
@@ -806,8 +799,6 @@ def run_disaggregated_test(example_dir,
             all_worker_procs,
             disagg_server.process,
             use_ray=True)
-        if post_client_test is not None:
-            post_client_test(server_url)
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -2282,18 +2273,6 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root, prompt_file):
-    # Helix CP disaggregated serving on the ctxtp2/gentp1cp2 config (4 GPUs),
-    # exercised with two prompt sets:
-    #   - "prompts.json": short prompts sent via the completion endpoint without
-    #     a chat template, each a single KV block (well under tokens_per_block=64),
-    #     fewer than the generation CP size (cp=2). The highest CP rank then owns
-    #     zero blocks for the sequence ("empty" rank), exercising the Helix
-    #     empty-rank path end-to-end: zero-block KV cache transmission (UCX) plus
-    #     a no-op attention/all-to-all combine contribution from the empty rank.
-    #     Output correctness is verified.
-    #   - "long_prompts.json": multi-block prompts that populate every CP rank
-    #     (the standard Helix path); output verification is skipped by the client
-    #     harness for long prompts.
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
@@ -2304,125 +2283,6 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
                            model_path=deepseek_v3_model_root,
                            cwd=llm_venv.get_working_directory(),
                            server_start_timeout=1200)
-
-
-async def _collect_disagg_completion_outputs(server_url, model_name, prompts,
-                                             max_tokens):
-    timeout = aiohttp.ClientTimeout(total=120)
-
-    async def collect_one(session, prompt):
-        payload = {
-            "model": model_name,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "ignore_eos": True,
-            "detokenize": False,
-        }
-        last_response = None
-        for attempt in range(60):
-            async with session.post(f"{server_url}/v1/completions",
-                                    json=payload,
-                                    timeout=timeout) as resp:
-                response_text = await resp.text()
-                if resp.status == 200:
-                    result = json.loads(response_text)
-                    break
-                last_response = response_text
-
-            if attempt == 59:
-                assert False, last_response
-            await asyncio.sleep(1)
-
-        choices = result.get("choices", [])
-        assert choices, f"Missing choices in response: {result}"
-        choice = choices[0]
-        usage = result.get("usage") or {}
-        return {
-            "token_ids": choice.get("token_ids"),
-            "finish_reason": choice.get("finish_reason"),
-            "stop_reason": choice.get("stop_reason"),
-            "completion_tokens": usage.get("completion_tokens"),
-            "prompt_tokens": usage.get("prompt_tokens"),
-            "avg_decoded_tokens_per_iter":
-            choice.get("avg_decoded_tokens_per_iter"),
-        }
-
-    async with aiohttp.ClientSession() as session:
-        tasks = [collect_one(session, prompt) for prompt in prompts]
-        return await asyncio.gather(*tasks)
-
-
-def _run_disagg_completion_outputs(test_desc, env, model_path, cwd, prompts):
-    run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = get_ucx_tls()
-    config_file = get_test_config(test_desc, None, os.path.dirname(__file__))
-    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file,
-                             model_name=model_path,
-                             env=run_env,
-                             cwd=cwd,
-                             server_start_timeout=1200)
-
-    try:
-        server_host = config.get("hostname", "localhost")
-        server_url = f"http://{server_host}:{server_port}"
-        return asyncio.run(
-            _collect_disagg_completion_outputs(server_url, config["model"],
-                                               prompts, max_tokens=16))
-    finally:
-        terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
-
-
-# Cached from the deterministic TP2 MTP reference path for the prompts below.
-_DEEPSEEK_V3_LITE_BF16_MTP_TP2_TOKEN_IDS = [
-    [
-        455, 30269, 62039, 852, 27472, 305, 64285, 8296, 14, 35666,
-        126664, 23809, 14889, 1469, 1066, 14
-    ],
-    [
-        455, 30269, 62039, 852, 27472, 305, 64285, 8296, 14, 35666,
-        126664, 23809, 14889, 1469, 1066, 14
-    ],
-    [
-        455, 10870, 1531, 5434, 73615, 14, 47468, 14, 305, 10792, 377,
-        3920, 270, 12775, 45459, 4123
-    ],
-]
-
-
-@pytest.mark.timeout(3600)
-@pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
-                         indirect=True)
-def test_disaggregated_deepseek_v3_lite_bf16_mtp_helix_matches_tp(
-        disaggregated_test_root, llm_venv, deepseek_v3_model_root):
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/bf16")
-
-    prompt_context = (
-        "Use this background when answering. The deployment separates prefill "
-        "and decode workers, transfers KV cache blocks between them, and uses "
-        "speculative MTP decoding to propose one extra token before acceptance. "
-        "The comparison should stay deterministic, concise, and focused on "
-        "whether the distributed topology changes the generated text. ")
-    prompts = [
-        prompt_context + "Summarize the serving flow in one sentence.",
-        prompt_context + "Name one practical reason to use disaggregated serving.",
-        prompt_context + "Explain why deterministic decoding is useful for tests.",
-    ]
-    helix_outputs = _run_disagg_completion_outputs(
-        "deepseek_v3_lite_bf16_tllm_gen_helix_one_mtp", llm_venv._new_env,
-        deepseek_v3_model_root, llm_venv.get_working_directory(), prompts)
-
-    helix_token_ids = [output["token_ids"] for output in helix_outputs]
-
-    assert helix_token_ids == _DEEPSEEK_V3_LITE_BF16_MTP_TP2_TOKEN_IDS, (
-        f"Helix MTP token IDs differ from TP MTP reference:\n"
-        f"reference={_DEEPSEEK_V3_LITE_BF16_MTP_TP2_TOKEN_IDS}\n"
-        f"helix={helix_outputs}")
-
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device(4)

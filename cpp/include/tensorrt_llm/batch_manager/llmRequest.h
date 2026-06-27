@@ -2247,9 +2247,7 @@ private:
 
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
-        // A request may legitimately have no input tokens on this rank (e.g. a Helix
-        // context-parallelism "empty" CP rank that owns zero KV blocks for the sequence).
-        // Guard against calling .back() on an empty vector (undefined behavior).
+        // Helix CP empty ranks can own no input tokens.
         mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.beamWidth)
                                           : VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
 

@@ -25,7 +25,6 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
-#include "tensorrt_llm/kernels/helixMlaKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -1241,6 +1240,9 @@ int AttentionOp::mlaGeneration(
         int* tile_scheduler_metadata_ptr = const_cast<int*>(params.flash_mla_tile_scheduler_metadata);
         int* num_splits_ptr = const_cast<int*>(params.flash_mla_num_splits);
 
+        // metadata should only be init once per iter, to fix later
+        get_mla_metadata_func(mlaMetaDataParams, stream);
+
         Flash_fwd_mla_params flashMlaParams{};
         flashMlaParams.b = batch_beam;
         flashMlaParams.seqlen_q = ngroups * s_q;
@@ -1258,9 +1260,8 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.scale_softmax = softmax_scale;
         flashMlaParams.scale_softmax_log2 = float(softmax_scale * M_LOG2E);
 
-        void const* qPtr = mFP8GenerationMLA ? reinterpret_cast<void const*>(params.quant_q_buf)
-                                             : reinterpret_cast<void const*>(params.q_buf);
-        flashMlaParams.q_ptr = const_cast<void*>(qPtr);
+        flashMlaParams.q_ptr = mFP8GenerationMLA ? const_cast<void*>(reinterpret_cast<void const*>(params.quant_q_buf))
+                                                 : const_cast<void*>(reinterpret_cast<void const*>(params.q_buf));
         flashMlaParams.k_ptr = kv_cache_buffer.mPrimaryPoolPtr;
         flashMlaParams.v_ptr = flashMlaParams.k_ptr;
         flashMlaParams.o_ptr = reinterpret_cast<void*>(params.context_buf);
@@ -1295,41 +1296,32 @@ int AttentionOp::mlaGeneration(
         flashMlaParams.softmax_lseaccum_ptr = softmax_lse_accum_ptr;
         flashMlaParams.oaccum_ptr = out_accum_ptr;
 
-        auto runFlashMla = [&](Flash_fwd_mla_params& runParams)
+        if constexpr (std::is_same<T, half>::value)
         {
-            if constexpr (std::is_same<T, half>::value)
+            if (mFP8GenerationMLA)
             {
-                if (mFP8GenerationMLA)
-                {
-                    TLLM_THROW("FP8 KV cache MLA is only supported for bf16 output");
-                }
-                else
-                {
-                    run_mha_fwd_splitkv_mla<cutlass::half_t, cutlass::half_t, 576>(runParams, stream);
-                }
-            }
-            else if constexpr (std::is_same<T, __nv_bfloat16>::value)
-            {
-                if (mFP8GenerationMLA)
-                {
-                    run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(runParams, stream);
-                }
-                else
-                {
-                    run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, cutlass::bfloat16_t, 576>(runParams, stream);
-                }
+                TLLM_THROW("FP8 KV cache MLA is only supported for bf16 output");
             }
             else
             {
-                TLLM_THROW("Unsupported data type for FlashMLA");
+                run_mha_fwd_splitkv_mla<cutlass::half_t, cutlass::half_t, 576>(flashMlaParams, stream);
             }
-        };
-
-        // metadata should only be init once per iter, to fix later
-        get_mla_metadata_func(mlaMetaDataParams, stream);
-        runFlashMla(flashMlaParams);
-        invokeConvertFlashMlaLseToHelixStats(
-            softmax_lse_ptr, generation_params.softmax_stats, batch_beam, s_q, num_q_heads, stream);
+        }
+        else if constexpr (std::is_same<T, __nv_bfloat16>::value)
+        {
+            if (mFP8GenerationMLA)
+            {
+                run_mha_fwd_splitkv_mla<cutlass::float_e4m3_t, cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+            }
+            else
+            {
+                run_mha_fwd_splitkv_mla<cutlass::bfloat16_t, cutlass::bfloat16_t, 576>(flashMlaParams, stream);
+            }
+        }
+        else
+        {
+            TLLM_THROW("Unsupported data type for FlashMLA");
+        }
     }
     else
     {

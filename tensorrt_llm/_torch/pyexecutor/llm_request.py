@@ -741,6 +741,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        self.py_num_real_draft_tokens = None
         self.py_total_spec_decode_num_draft_tokens = 0
         self.py_total_spec_decode_num_accepted_tokens = 0
         self.py_num_accepted_draft_tokens_indices = []
@@ -1233,13 +1234,18 @@ def get_spec_decode_token_counts(request: LlmRequest) -> tuple[int, int]:
     accepted_tokens = max(
         int(getattr(request, 'py_num_accepted_draft_tokens', 0) or 0), 0)
     rewind_len = max(int(getattr(request, 'py_rewind_len', 0) or 0), 0)
-    draft_len = accepted_tokens + rewind_len
+    runtime_draft_len = accepted_tokens + rewind_len
 
-    if draft_len == 0:
-        py_draft_tokens = getattr(request, 'py_draft_tokens', None)
-        draft_len = int(getattr(request, 'num_draft_tokens', 0) or 0)
-        if draft_len == 0 and py_draft_tokens is not None:
-            draft_len = len(py_draft_tokens)
+    if runtime_draft_len == 0:
+        return 0, 0
+
+    real_draft_len = getattr(request, 'py_num_real_draft_tokens', None)
+    if real_draft_len is not None and 0 <= int(
+            real_draft_len) <= runtime_draft_len:
+        real_draft_len = int(real_draft_len)
+        draft_len = real_draft_len
+    else:
+        draft_len = runtime_draft_len
 
     if draft_len <= 0:
         return 0, 0

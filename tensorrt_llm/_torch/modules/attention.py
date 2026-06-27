@@ -25,7 +25,7 @@ from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
-                           cp_allgather, cp_reducescatter, reducescatter)
+                           cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -147,40 +147,11 @@ def attn_custom_op_inplace(
 
 def _helix_zero_kv_mask(attn_metadata: AttentionMetadata,
                         num_tokens: int) -> Optional[torch.Tensor]:
-    """Return a bool mask marking tokens with zero local KV length on this CP rank.
-
-    These are ranks that own no blocks for the sequence. kv_lens_cuda is stored
-    per sequence, while Helix post-processing consumes rows packed per token. Use
-    seq_lens_cuda to expand sequence-level zero-KV flags to token rows with a
-    static num_tokens-sized result. Returns None when the KV length buffer is
-    unavailable.
-    """
-    kv_lens = getattr(attn_metadata, "kv_lens_cuda", None)
-    if kv_lens is None:
-        return None
+    """Return the precomputed zero-local-KV token mask for this CP rank."""
     helix_zero_kv_mask = getattr(attn_metadata, "helix_zero_kv_mask", None)
     if helix_zero_kv_mask is not None:
         return helix_zero_kv_mask[:num_tokens]
-
-    kv_lens = kv_lens.reshape(-1)
-    seq_lens = getattr(attn_metadata, "seq_lens_cuda", None)
-    num_seqs = getattr(attn_metadata, "num_seqs", None)
-    if seq_lens is None or num_seqs is None:
-        return kv_lens[:num_tokens] == 0
-
-    if num_seqs == 0:
-        return kv_lens[:num_tokens] == 0
-
-    seq_lens = seq_lens[:num_seqs].to(device=kv_lens.device, dtype=torch.long)
-    zero_seq_mask = kv_lens[:num_seqs] == 0
-    if num_tokens == num_seqs:
-        return zero_seq_mask[:num_tokens]
-
-    cu_q_lens = torch.cumsum(seq_lens, dim=0)
-    token_ids = torch.arange(num_tokens, dtype=torch.long, device=kv_lens.device)
-    seq_ids = torch.searchsorted(cu_q_lens, token_ids, right=True)
-    seq_ids = torch.clamp(seq_ids, max=num_seqs - 1)
-    return (token_ids < cu_q_lens[-1]) & zero_seq_mask[seq_ids]
+    return None
 
 
 def _helix_sanitize_empty_kv(
@@ -217,26 +188,6 @@ def _helix_sanitize_empty_kv(
     sm_sum = softmax_stats[..., 1].masked_fill(softmax_mask, 0.0)
     softmax_stats = torch.stack([sm_max, sm_sum], dim=-1)
     return partial_o, softmax_stats
-
-
-def _helix_softmax_correction(
-    local_softmax_stats: torch.Tensor,
-    gathered_softmax_stats: torch.Tensor,
-    cp_size: int,
-) -> torch.Tensor:
-    num_tokens, num_heads, _ = local_softmax_stats.shape
-    gathered_softmax_stats = gathered_softmax_stats.reshape(
-        num_tokens, cp_size, num_heads, 2)
-    local_max = local_softmax_stats[..., 0]
-    local_sum = local_softmax_stats[..., 1]
-    global_max = gathered_softmax_stats[..., 0].max(dim=1).values
-    denominator = (
-        gathered_softmax_stats[..., 1] *
-        torch.exp(gathered_softmax_stats[..., 0] -
-                  global_max[:, None, :])).sum(dim=1)
-    numerator = local_sum * torch.exp(local_max - global_max)
-    return torch.where(denominator > 0, numerator / denominator,
-                       torch.zeros_like(denominator))
 
 
 @torch.compile(options={"max-autotune": True})
@@ -1938,21 +1889,6 @@ class MLA(nn.Module):
                     is not None)
         return self.v_b_proj.dtype == torch.bfloat16
 
-    def _use_helix_project_v_before_alltoall(self, is_generation: bool) -> bool:
-        if not is_generation or not self.mapping.has_cp_helix():
-            return False
-        if not self.mapping.cp_config.get("helix_project_v_before_alltoall",
-                                          True):
-            return False
-        return self._supports_helix_full_v_projection()
-
-    def _use_helix_stats_reduce_scatter(self, is_generation: bool) -> bool:
-        if not is_generation or not self.mapping.has_cp_helix():
-            return False
-        if not self.mapping.cp_config.get("helix_stats_reduce_scatter", True):
-            return False
-        return self._supports_helix_full_v_projection()
-
     def _full_v_b_proj_weight(self) -> torch.Tensor:
         _, v_b_proj = self.kv_b_proj.weight.split(
             [
@@ -2019,18 +1955,6 @@ class MLA(nn.Module):
         partial_v = self._project_helix_latent_to_v(partial_o)
         partial_v = partial_v.view(-1, self.num_heads_tp, self.v_head_dim)
 
-        if self.mapping.cp_config.get("helix_stats_use_nccl_transport", False):
-            gathered_softmax_stats = cp_allgather(softmax_stats,
-                                                  self.mapping,
-                                                  dim=1)
-            correction = _helix_softmax_correction(softmax_stats,
-                                                   gathered_softmax_stats,
-                                                   self.mapping.cp_size)
-            partial_v = partial_v * correction.unsqueeze(-1).to(partial_v.dtype)
-            attn_out_v = cp_reducescatter(partial_v, self.mapping, dim=1)
-            return attn_out_v.reshape(partial_o.shape[0],
-                                      self.num_heads_tp_cp * self.v_head_dim)
-
         num_tokens = partial_o.shape[0]
         cp_size = self.mapping.cp_size
         helix = HelixAllToAllNative.get(self.mapping)
@@ -2068,8 +1992,6 @@ class MLA(nn.Module):
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
-        project_v_before_alltoall = kwargs.pop("project_v_before_alltoall",
-                                               False)
         stats_reduce_scatter = kwargs.pop("stats_reduce_scatter", False)
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
@@ -2093,16 +2015,11 @@ class MLA(nn.Module):
                 return self._helix_stats_reduce_scatter(
                     partial_o, softmax_stats, zero_kv_mask)
 
-            value_dim = kv_lora_rank
-            if project_v_before_alltoall:
-                partial_o = self._project_helix_latent_to_v(partial_o)
-                value_dim = self.v_head_dim
-
             return _helix_post_process(partial_o,
                                        softmax_stats,
                                        self.mapping,
                                        self.num_heads_tp_cp,
-                                       value_dim,
+                                       kv_lora_rank,
                                        self.aux_stream,
                                        self.ln_events,
                                        zero_kv_mask=zero_kv_mask)
@@ -3332,11 +3249,8 @@ class MLA(nn.Module):
 
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.generation_only
-        stats_reduce_scatter = self._use_helix_stats_reduce_scatter(
-            is_generation=True)
-        project_v_before_alltoall = (
-            not stats_reduce_scatter
-            and self._use_helix_project_v_before_alltoall(is_generation=True))
+        stats_reduce_scatter = (self.mapping.has_cp_helix()
+                                and self._supports_helix_full_v_projection())
 
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -3358,12 +3272,11 @@ class MLA(nn.Module):
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-            project_v_before_alltoall=project_v_before_alltoall,
             stats_reduce_scatter=stats_reduce_scatter,
         )
         fused_q = None
 
-        if stats_reduce_scatter or project_v_before_alltoall:
+        if stats_reduce_scatter:
             assert (attn_out_latent.shape[0] == q.shape[0]
                     and attn_out_latent.shape[1]
                     == self.num_heads_tp_cp * self.v_head_dim)

@@ -98,10 +98,7 @@ template <typename T>
 std::list<std::vector<T>> chopVectorIntoBlocks(
     std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
 {
-    // No usable elements yields no blocks. Guard non-positive usableSize explicitly: callers may pass
-    // usableSize = inputLength - 1, which is -1 for a Helix CP "empty" rank with 0 input tokens. With a
-    // negative usableSize, "vec.begin() + usableSize" is undefined behavior and underflows for an empty
-    // vector (begin() == nullptr), producing a bogus huge range below.
+    // Helix CP empty ranks can pass inputLength - 1 == -1.
     if (usableSize <= 0)
     {
         return {};

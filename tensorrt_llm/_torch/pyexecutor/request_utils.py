@@ -252,10 +252,7 @@ def partition_context_for_helix(
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
 
-        When num_total_blocks < cp_size, the highest-indexed CP ranks own no blocks
-        for this sequence; those empty ranks return empty token and position lists.
-        input_len still reflects the full prompt length so global position ids stay
-        correct.
+        CP ranks that own no blocks return empty token and position lists.
 
     Raises:
         ValueError: If the prompt is empty (no blocks to distribute).
@@ -268,12 +265,6 @@ def partition_context_for_helix(
         raise ValueError(
             "Cannot partition an empty prompt for Helix CP: num_total_blocks == 0."
         )
-    # NOTE: When num_total_blocks < cp_size, CP ranks in [num_total_blocks, cp_size)
-    # own zero blocks ("empty" ranks). This is supported: such ranks contribute a
-    # no-op (-inf, 0) to the Helix attention combine and receive zero KV blocks
-    # during cache transmission. Rank 0 always owns global block 0, so the combine
-    # denominator is never zero.
-
     # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
     if input_len % tokens_per_block != 0:
@@ -282,15 +273,11 @@ def partition_context_for_helix(
         all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
     all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
 
-    # Round-robin block assignment across CP ranks: rank r owns blocks {r, r+cp_size, r+2*cp_size, ...}.
-    # This must agree with the C++ KV cache split kernels (cacheSplitConcat.cu) so that the input
-    # tokens this rank processes correspond to the KV blocks it received from the context server.
     input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
     position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
 
     my_input_blocks = input_id_blocks[cp_rank::cp_size]
     my_position_blocks = position_id_blocks[cp_rank::cp_size]
-    # Empty rank: this CP rank owns no blocks for this sequence (num_total_blocks < cp_size).
     if len(my_input_blocks) == 0:
         return [], [], input_len, padding_len
 
@@ -299,8 +286,6 @@ def partition_context_for_helix(
         torch.cat(my_position_blocks, dim=-1).flatten().tolist()
     )
 
-    # The (single) padded block is the global last block; under round-robin it is owned by rank
-    # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
     last_block_owner = (num_total_blocks - 1) % cp_size
     if cp_rank == last_block_owner and padding_len > 0:
         input_ids_this_rank = input_ids_this_rank[:-padding_len]

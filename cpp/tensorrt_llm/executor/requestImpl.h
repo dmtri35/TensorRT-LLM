@@ -510,11 +510,7 @@ public:
 private:
     void validate()
     {
-        // Empty input tokens are allowed. A disaggregated generation request receives its KV cache
-        // from the context server instead of recomputing it from tokens (this includes Helix
-        // context-parallelism ranks that own zero KV-cache blocks). The request type and context
-        // phase params that identify such a request are set after construction, so the empty-token
-        // case cannot be gated here.
+        // Disaggregated generation requests can receive KV without local input tokens.
         TLLM_CHECK(mMaxNewTokens > 0);
 
         // Show warning message unless mNumReturnSequences is the default value.

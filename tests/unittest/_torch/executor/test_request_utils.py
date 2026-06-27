@@ -94,11 +94,6 @@ def test_merge_helix_requests_with_padding():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
-        # Round-robin block distribution across 4 CP ranks (7 blocks total, 2 tokens/block):
-        #   rank 0 owns blocks {0, 4} -> tokens [1,2, 9,10]
-        #   rank 1 owns blocks {1, 5} -> tokens [3,4, 11,12]
-        #   rank 2 owns blocks {2, 6} -> tokens [5,6, 13]  (block 6 is the last block; padding stripped)
-        #   rank 3 owns block  {3}    -> tokens [7,8]
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 9, 10]
         elif rank == 1:
@@ -145,9 +140,6 @@ def test_merge_helix_requests_without_padding():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
-        # Round-robin block distribution across 2 CP ranks (3 blocks total, 4 tokens/block):
-        #   rank 0 owns blocks {0, 2} -> tokens [1,2,3,4, 9,10,11,12]
-        #   rank 1 owns block  {1}    -> tokens [5,6,7,8]
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 3, 4, 9, 10, 11, 12]
         else:
@@ -155,15 +147,9 @@ def test_merge_helix_requests_without_padding():
 
 
 def test_merge_helix_requests_empty_ranks():
-    """When num_total_blocks < cp_size, the highest CP ranks own no blocks.
-
-    Such "empty" ranks must produce an empty token list (and seqlen_this_rank_cp
-    == 0), while total_input_len_cp still reflects the full prompt length so the
-    global position ids stay correct. They are no longer rejected.
-    """
+    """CP ranks without owned blocks produce an empty token list."""
     tokens_per_block = 4
 
-    # 12 tokens -> 3 blocks, which is fewer than 4 CP ranks, so rank 3 is empty.
     input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     executor_request = trtllm.Request(
         input_token_ids=input_tokens,
@@ -179,11 +165,6 @@ def test_merge_helix_requests_empty_ranks():
 
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
-    # Round-robin block distribution across 4 CP ranks (3 blocks total, 4 tokens/block):
-    #   rank 0 owns block {0} -> tokens [1,2,3,4]
-    #   rank 1 owns block {1} -> tokens [5,6,7,8]
-    #   rank 2 owns block {2} -> tokens [9,10,11,12]
-    #   rank 3 owns no blocks -> [] (empty rank)
     expected_tokens = {
         0: [1, 2, 3, 4],
         1: [5, 6, 7, 8],
@@ -204,7 +185,6 @@ def test_merge_helix_requests_empty_ranks():
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
         assert llm_request.get_tokens(0) == expected_tokens[rank]
-        # total_input_len_cp is always the full prompt length.
         assert llm_request.total_input_len_cp == len(input_tokens)
         assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
 
@@ -264,11 +244,6 @@ def test_merge_requests_with_helix_cp_config():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
-        # Round-robin block distribution across 4 CP ranks (7 blocks total, 2 tokens/block):
-        #   rank 0 owns blocks {0, 4} -> tokens [1,2, 9,10]
-        #   rank 1 owns blocks {1, 5} -> tokens [3,4, 11,12]
-        #   rank 2 owns blocks {2, 6} -> tokens [5,6, 13]  (block 6 is the last block; padding stripped)
-        #   rank 3 owns block  {3}    -> tokens [7,8]
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 9, 10]
         elif rank == 1:

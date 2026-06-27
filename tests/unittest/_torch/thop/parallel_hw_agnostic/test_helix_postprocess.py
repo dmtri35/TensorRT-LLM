@@ -14,14 +14,12 @@
 # limitations under the License.
 
 import unittest
-from types import SimpleNamespace
 
 import pytest
 import torch
 from parameterized import parameterized
 
 import tensorrt_llm
-from tensorrt_llm._torch.modules.attention import _helix_zero_kv_mask
 
 
 def baseline(gathered_o, gathered_stats, kv_lora_rank, scale, native_v1=False, native_v2=False):
@@ -93,27 +91,6 @@ class TestHelixPostProcess(unittest.TestCase):
         tensorrt_llm.logger.set_level("warning")
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
-
-    def test_helix_zero_kv_mask_expands_sequence_mask_to_tokens(self):
-        metadata = SimpleNamespace(
-            kv_lens_cuda=torch.tensor([0, 7, 0], dtype=torch.int32),
-            seq_lens_cuda=torch.tensor([2, 1, 3], dtype=torch.int32),
-            num_seqs=3,
-        )
-
-        mask = _helix_zero_kv_mask(metadata, num_tokens=6)
-
-        assert mask.tolist() == [True, True, False, True, True, True]
-
-    def test_helix_zero_kv_mask_prefers_precomputed_token_mask(self):
-        metadata = SimpleNamespace(
-            kv_lens_cuda=torch.tensor([1, 1], dtype=torch.int32),
-            helix_zero_kv_mask=torch.tensor([False, True, True, False]),
-        )
-
-        mask = _helix_zero_kv_mask(metadata, num_tokens=3)
-
-        assert mask.tolist() == [False, True, True]
 
     def _test_helix_postprocess(
         self,
@@ -313,15 +290,6 @@ class TestHelixPostProcess(unittest.TestCase):
         )
 
     def test_helix_postprocess_empty_rank_noop(self):
-        """A CP rank that owns no KV blocks (num_total_blocks < cp_size) must be a
-        no-op in the combine: it contributes (-inf, 0) softmax stats and a zeroed
-        partial output. The result must match combining only the non-empty ranks
-        and stay finite.
-
-        This mirrors the Python post-sanitization in _helix_post_process, which
-        forces zero-local-KV rows to (-inf, 0) and zeros their partial output
-        before this op runs.
-        """
         device = torch.device("cuda")
         cp_size, num_tokens, num_heads, kv_lora_rank = 4, 8, 2, 64
         dtype = torch.float16
@@ -337,8 +305,6 @@ class TestHelixPostProcess(unittest.TestCase):
         gathered_stats[..., 0] = gathered_o_max[..., 0]
         gathered_stats[..., 1] = torch.sum(torch.exp(gathered_o - gathered_o_max), dim=-1)
 
-        # Mark the highest CP rank as "empty" (rank 0 always owns block 0, so it
-        # is never empty). Empty rank: (-inf, 0) stats and zeroed partial output.
         empty = cp_size - 1
         gathered_stats[empty, ..., 0] = float("-inf")
         gathered_stats[empty, ..., 1] = 0.0
@@ -347,7 +313,6 @@ class TestHelixPostProcess(unittest.TestCase):
         gathered_o_v = gathered_o.view(cp_size, num_tokens, num_heads * kv_lora_rank)
         output = torch.ops.trtllm.helix_post_process(gathered_o_v, gathered_stats, scale)
 
-        # Reference: combine only the non-empty ranks.
         expected = baseline(
             gathered_o_v[:empty].contiguous(),
             gathered_stats[:empty].contiguous(),

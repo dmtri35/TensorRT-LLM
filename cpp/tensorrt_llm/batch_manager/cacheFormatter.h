@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,6 +50,9 @@ void sendAllBuffers(TransferSession& session, int deviceId,
     std::vector<runtime::ITensor::SharedPtr> const& outputBuffers, size_t bufferCoverTargetNum,
     runtime::ITensor::SharedPtr const& preAllocSendBuffer, runtime::BufferManager const& bufferManager,
     executor::kv_cache::TargetRanksInfo const& targetInfo, std::vector<size_t> const& pickUpConnections);
+
+void releasePreAssignedRecvBuffer(
+    executor::kv_cache::Connection const* connection, BaseTransBufferManager* manager, BufferKind kind);
 
 namespace cache_formatter_utils
 {

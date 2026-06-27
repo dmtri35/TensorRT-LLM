@@ -134,13 +134,7 @@ def _build_helix_spec_decoding_position_offsets(
 def _should_use_helix_spec_decoding_mask(
         is_mla_enable: bool, attention_input_type: AttentionInputType,
         mask_ready: bool, sm: int) -> bool:
-    # TllmGen does not ship Custom-mask MLA generation cubins for DeepSeek's
-    # HQk576/HV512 shapes, so enabling the mask would fail kernel selection.
-    is_blackwell_gen = not (sm < 100 or sm in [120, 121])
-    is_generation = attention_input_type == AttentionInputType.generation_only
-    if is_mla_enable:
-        return False
-    return is_generation and mask_ready and is_blackwell_gen
+    return False
 
 
 def _should_use_helix_owned_token_counts(

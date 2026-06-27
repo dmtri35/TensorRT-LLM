@@ -453,18 +453,17 @@ class HelixAllToAllNative:
         return partial_o_out, softmax_stats_out
 
 
-def _reducescatter(
+def reducescatter(
     input: Union[torch.Tensor, List[torch.Tensor]],
-    group: List[int],
-    group_boxed: Optional[object] = None,
+    mapping: Mapping,
     dim: int = -1,
     sizes: Optional[List[int]] = None,
 ) -> Union[torch.Tensor, List[torch.Tensor]]:
-    if len(group) == 1:
+    if mapping.tp_size == 1:
         return input
 
     if sizes is not None:
-        assert len(sizes) == len(group)
+        assert len(sizes) == len(mapping.tp_group)
         sum_split_size = sum(sizes)
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sum_split_size
@@ -480,7 +479,7 @@ def _reducescatter(
             x = x.contiguous().view(-1, x_info['numel_base'])
         else:
             if sizes is None:
-                x_list = x.chunk(len(group), dim=dim)
+                x_list = x.chunk(mapping.tp_size, dim=dim)
             else:
                 x_list = x.split(sizes, dim=dim)
             x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
@@ -506,9 +505,10 @@ def _reducescatter(
         ]
 
     if mpi_disabled():
-        output = torch_op(input, sizes, group, group_boxed)
+        output = torch_op(input, sizes, mapping.tp_group,
+                          mapping.tp_group_pg.boxed())
     else:
-        output = torch_op(input, sizes, group)
+        output = torch_op(input, sizes, mapping.tp_group)
 
     if isinstance(input, torch.Tensor):
         output = output.view(output_info['output_shape'])
@@ -519,26 +519,6 @@ def _reducescatter(
         ]
         output = restore_full_output(output, valid)
     return output
-
-
-def reducescatter(
-    input: Union[torch.Tensor, List[torch.Tensor]],
-    mapping: Mapping,
-    dim: int = -1,
-    sizes: Optional[List[int]] = None,
-) -> Union[torch.Tensor, List[torch.Tensor]]:
-    group_boxed = mapping.tp_group_pg.boxed() if mpi_disabled() else None
-    return _reducescatter(input, mapping.tp_group, group_boxed, dim, sizes)
-
-
-def cp_reducescatter(
-    input: Union[torch.Tensor, List[torch.Tensor]],
-    mapping: Mapping,
-    dim: int = -1,
-    sizes: Optional[List[int]] = None,
-) -> Union[torch.Tensor, List[torch.Tensor]]:
-    group_boxed = mapping.cp_group_pg.boxed() if mpi_disabled() else None
-    return _reducescatter(input, mapping.cp_group, group_boxed, dim, sizes)
 
 
 class MNNVLAllReduce(nn.Module):
