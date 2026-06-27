@@ -3,6 +3,7 @@
 
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import torch
@@ -458,6 +459,67 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
         batch.context_requests_last_chunk = requests
         kv_cache_manager.prepare_resources(batch)
         model_engine.forward(batch, resource_manager)
+
+    def test_update_target_input_tensors_indexes_accepted_counts_by_slot(self):
+        total_num_tokens = 4
+        num_extend_requests = 1
+        num_tokens_per_request = 4
+        num_draft_tokens = 3
+
+        model_engine = SimpleNamespace(
+            idx_accepted_tokens_cache=torch.zeros(total_num_tokens,
+                                                  dtype=torch.long),
+            position_ids_cuda=torch.zeros(total_num_tokens,
+                                          dtype=torch.int32),
+            num_accepted_draft_tokens_cuda=torch.zeros(4, dtype=torch.int32),
+            input_ids_cuda=torch.empty(total_num_tokens, dtype=torch.int32),
+            draft_tokens_cuda=torch.empty(num_draft_tokens,
+                                          dtype=torch.int32),
+            previous_pos_indices_cuda=torch.empty(total_num_tokens,
+                                                  dtype=torch.int32),
+            previous_pos_id_offsets_cuda=torch.ones(total_num_tokens,
+                                                    dtype=torch.int32),
+            previous_kv_lens_offsets_cuda=torch.ones(num_extend_requests,
+                                                     dtype=torch.int32),
+        )
+
+        previous_slots = torch.tensor([3], dtype=torch.long)
+        num_accepted_tokens_device = torch.tensor([1, 2, 3, 4],
+                                                 dtype=torch.int32)
+        new_tokens_lens_device = torch.tensor([4, 5, 6, 7],
+                                              dtype=torch.int32)
+        new_tokens_device = torch.arange(
+            num_tokens_per_request * 4,
+            dtype=torch.int32).reshape(num_tokens_per_request, 4, 1)
+        next_draft_tokens_device = torch.arange(
+            4 * num_draft_tokens,
+            dtype=torch.int32).reshape(4, num_draft_tokens)
+
+        PyTorchModelEngine._update_target_input_tensors(
+            model_engine,
+            num_accepted_tokens_device=num_accepted_tokens_device,
+            new_tokens_device=new_tokens_device,
+            next_draft_tokens_device=next_draft_tokens_device,
+            new_tokens_lens_device=new_tokens_lens_device,
+            previous_slots=previous_slots,
+            total_num_tokens=total_num_tokens,
+            num_extend_reqeust_wo_dummy=num_extend_requests,
+            num_tokens_per_extend_request=num_tokens_per_request,
+            previous_batch_draft_tokens=num_draft_tokens)
+
+        self.assertEqual(model_engine.num_accepted_draft_tokens_cuda[0].item(),
+                         4)
+        torch.testing.assert_close(
+            model_engine.input_ids_cuda,
+            new_tokens_device[:, previous_slots[0], 0])
+        torch.testing.assert_close(
+            model_engine.draft_tokens_cuda,
+            next_draft_tokens_device[previous_slots[0]])
+        torch.testing.assert_close(
+            model_engine.previous_pos_id_offsets_cuda,
+            torch.full((total_num_tokens, ), 7, dtype=torch.int32))
+        self.assertEqual(model_engine.previous_kv_lens_offsets_cuda[0].item(),
+                         3)
 
     @skip_ray
     def test_prepare_tp_inputs_with_helix_parallelism(self) -> None:

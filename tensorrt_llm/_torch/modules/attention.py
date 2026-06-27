@@ -176,6 +176,16 @@ def _helix_sanitize_empty_kv(
     """
     if zero_kv_mask is None:
         return partial_o, softmax_stats
+    return _helix_compiled_sanitize_empty_kv(partial_o, softmax_stats,
+                                             zero_kv_mask)
+
+
+@torch.compile(options={"max-autotune": True})
+def _helix_compiled_sanitize_empty_kv(
+    partial_o: torch.Tensor,
+    softmax_stats: torch.Tensor,
+    zero_kv_mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     num_tokens = partial_o.shape[0]
     mask = zero_kv_mask.reshape(-1)[:num_tokens]
     partial_o_mask = mask.view((num_tokens, ) + (1, ) * (partial_o.dim() - 1))

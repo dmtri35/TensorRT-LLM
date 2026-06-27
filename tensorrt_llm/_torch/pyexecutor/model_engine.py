@@ -227,6 +227,58 @@ def _get_num_tokens_after_helix_cp(num_tokens: int, mapping: Mapping) -> int:
     return num_tokens
 
 
+@torch.compile(options={"max-autotune": True})
+def _helix_overlap_params_tensor(current_positions, position_offsets, seq_lens,
+                                 total_input_lens, kv_lens_cuda,
+                                 previous_batch_tokens: int,
+                                 num_gen_requests: int,
+                                 tokens_per_block: int, cp_size: int,
+                                 cp_rank: int, restore: bool):
+    old_positions = (current_positions - position_offsets
+                     if restore else current_positions)
+    new_positions = old_positions + position_offsets
+
+    seq_ids_local = torch.repeat_interleave(
+        torch.arange(num_gen_requests,
+                     device=current_positions.device,
+                     dtype=torch.long),
+        seq_lens,
+        output_size=previous_batch_tokens)
+    seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    local_token_idx = torch.arange(
+        previous_batch_tokens,
+        device=current_positions.device,
+        dtype=torch.long) - seq_starts[seq_ids_local]
+
+    total_input_len = total_input_lens[seq_ids_local].to(
+        device=current_positions.device, dtype=torch.int64)
+    old_decode_index = old_positions - total_input_len
+    new_decode_index = new_positions - total_input_len
+    old_owner = ((old_decode_index // tokens_per_block) % cp_size) == cp_rank
+    new_owner = ((new_decode_index // tokens_per_block) % cp_size) == cp_rank
+
+    accepted_owner = old_owner & (local_token_idx < position_offsets)
+    old_owned_counts = torch.zeros(num_gen_requests,
+                                   dtype=torch.int32,
+                                   device=current_positions.device)
+    new_owned_counts = torch.zeros_like(old_owned_counts)
+    accepted_owned_counts = torch.zeros_like(old_owned_counts)
+    old_owned_counts.scatter_add_(0, seq_ids_local, old_owner.to(torch.int32))
+    new_owned_counts.scatter_add_(0, seq_ids_local, new_owner.to(torch.int32))
+    accepted_owned_counts.scatter_add_(0, seq_ids_local,
+                                       accepted_owner.to(torch.int32))
+    kv_lens_delta = accepted_owned_counts + new_owned_counts - old_owned_counts
+
+    target_kv_lens_delta = -kv_lens_delta if restore else kv_lens_delta
+    target_kv_lens = kv_lens_cuda.to(
+        device=current_positions.device,
+        dtype=kv_lens_delta.dtype) + target_kv_lens_delta
+    zero_kv_mask = target_kv_lens[seq_ids_local] == 0
+
+    return (old_positions, new_positions, old_owner, new_owner, kv_lens_delta,
+            zero_kv_mask)
+
+
 class PyTorchModelEngine(ModelEngine):
 
     def __init__(
@@ -2223,56 +2275,72 @@ class PyTorchModelEngine(ModelEngine):
         token_end = token_start + previous_batch_tokens
         current_positions = attn_metadata.helix_position_offsets[
             token_start:token_end].to(torch.int64)
-        old_positions = (current_positions - position_offsets
-                         if restore else current_positions)
-        new_positions = old_positions + position_offsets
 
         seq_lens = attn_metadata.seq_lens_cuda[
             num_ctx_requests:attn_metadata.num_seqs].to(device=device,
                                                         dtype=torch.long)
         num_gen_requests = attn_metadata.num_seqs - num_ctx_requests
-        seq_ids_local = torch.repeat_interleave(
-            torch.arange(num_gen_requests, device=device, dtype=torch.long),
-            seq_lens,
-            output_size=previous_batch_tokens)
-        seq_ids = seq_ids_local + num_ctx_requests
-        seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
-        local_token_idx = torch.arange(
-            previous_batch_tokens, device=device,
-            dtype=torch.long) - seq_starts[seq_ids_local]
+        kv_lens_cuda = getattr(attn_metadata, 'kv_lens_cuda', None)
+        if kv_lens_cuda is None:
+            old_positions = (current_positions - position_offsets
+                             if restore else current_positions)
+            new_positions = old_positions + position_offsets
 
-        total_input_len = attn_metadata.helix_total_input_len[
-            seq_ids].to(device=device, dtype=torch.int64)
-        tokens_per_block = attn_metadata.tokens_per_block
-        old_decode_index = old_positions - total_input_len
-        new_decode_index = new_positions - total_input_len
-        old_owner = ((old_decode_index // tokens_per_block) %
-                     self.mapping.cp_size) == self.mapping.cp_rank
-        new_owner = ((new_decode_index // tokens_per_block) %
-                     self.mapping.cp_size) == self.mapping.cp_rank
+            seq_ids_local = torch.repeat_interleave(
+                torch.arange(num_gen_requests, device=device,
+                             dtype=torch.long),
+                seq_lens,
+                output_size=previous_batch_tokens)
+            seq_ids = seq_ids_local + num_ctx_requests
+            seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+            local_token_idx = torch.arange(
+                previous_batch_tokens, device=device,
+                dtype=torch.long) - seq_starts[seq_ids_local]
 
-        accepted_owner = old_owner & (local_token_idx < position_offsets)
-        old_owned_counts = torch.zeros(num_gen_requests,
-                                       dtype=torch.int32,
-                                       device=device)
-        new_owned_counts = torch.zeros_like(old_owned_counts)
-        accepted_owned_counts = torch.zeros_like(old_owned_counts)
-        old_owned_counts.scatter_add_(0, seq_ids_local,
-                                      old_owner.to(torch.int32))
-        new_owned_counts.scatter_add_(0, seq_ids_local,
-                                      new_owner.to(torch.int32))
-        accepted_owned_counts.scatter_add_(0, seq_ids_local,
-                                           accepted_owner.to(torch.int32))
-        kv_lens_delta = accepted_owned_counts + new_owned_counts - old_owned_counts
+            total_input_len = attn_metadata.helix_total_input_len[
+                seq_ids].to(device=device, dtype=torch.int64)
+            tokens_per_block = attn_metadata.tokens_per_block
+            old_decode_index = old_positions - total_input_len
+            new_decode_index = new_positions - total_input_len
+            old_owner = ((old_decode_index // tokens_per_block) %
+                         self.mapping.cp_size) == self.mapping.cp_rank
+            new_owner = ((new_decode_index // tokens_per_block) %
+                         self.mapping.cp_size) == self.mapping.cp_rank
+
+            accepted_owner = old_owner & (local_token_idx < position_offsets)
+            old_owned_counts = torch.zeros(num_gen_requests,
+                                           dtype=torch.int32,
+                                           device=device)
+            new_owned_counts = torch.zeros_like(old_owned_counts)
+            accepted_owned_counts = torch.zeros_like(old_owned_counts)
+            old_owned_counts.scatter_add_(0, seq_ids_local,
+                                          old_owner.to(torch.int32))
+            new_owned_counts.scatter_add_(0, seq_ids_local,
+                                          new_owner.to(torch.int32))
+            accepted_owned_counts.scatter_add_(0, seq_ids_local,
+                                               accepted_owner.to(torch.int32))
+            kv_lens_delta = (
+                accepted_owned_counts + new_owned_counts - old_owned_counts)
+            zero_kv_mask = None
+        else:
+            old_positions, new_positions, old_owner, new_owner, kv_lens_delta, zero_kv_mask = (
+                _helix_overlap_params_tensor(
+                    current_positions,
+                    position_offsets,
+                    seq_lens,
+                    attn_metadata.helix_total_input_len[
+                        num_ctx_requests:attn_metadata.num_seqs],
+                    kv_lens_cuda[num_ctx_requests:attn_metadata.num_seqs],
+                    previous_batch_tokens,
+                    num_gen_requests,
+                    attn_metadata.tokens_per_block,
+                    self.mapping.cp_size,
+                    self.mapping.cp_rank,
+                    restore,
+                ))
 
         helix_zero_kv_mask = getattr(attn_metadata, 'helix_zero_kv_mask', None)
-        kv_lens_cuda = getattr(attn_metadata, 'kv_lens_cuda', None)
-        if helix_zero_kv_mask is not None and kv_lens_cuda is not None:
-            kv_lens = kv_lens_cuda[num_ctx_requests:attn_metadata.num_seqs].to(
-                device=device, dtype=kv_lens_delta.dtype)
-            target_kv_lens_delta = -kv_lens_delta if restore else kv_lens_delta
-            target_kv_lens = kv_lens + target_kv_lens_delta
-            zero_kv_mask = target_kv_lens[seq_ids_local] == 0
+        if helix_zero_kv_mask is not None and zero_kv_mask is not None:
             helix_zero_kv_mask[token_start:token_end].copy_(
                 zero_kv_mask.to(device=helix_zero_kv_mask.device))
 
@@ -2907,7 +2975,8 @@ class PyTorchModelEngine(ModelEngine):
             self.num_accepted_draft_tokens_cuda[idx_accepted_tokens] + 1)
 
         self.num_accepted_draft_tokens_cuda[:num_extend_reqeust_wo_dummy].copy_(
-            num_accepted_tokens_device[:num_extend_reqeust_wo_dummy],
+            num_accepted_tokens_device[
+                previous_slots[:num_extend_reqeust_wo_dummy]],
             non_blocking=True)
 
         # Initialize offset tensors to zeros

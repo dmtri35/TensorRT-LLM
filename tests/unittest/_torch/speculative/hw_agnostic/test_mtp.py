@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 
 import torch
 from parameterized import parameterized
@@ -21,6 +22,137 @@ def unittest_name_func(testcase_func, param_num, param):
 class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level("warning")
+
+    def test_helix_draft_owner_mask_accepts_long_seq_lens(self):
+        mapping = SimpleNamespace(cp_size=2,
+                                  cp_rank=1,
+                                  has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+
+        batch_size = 2
+        num_tokens = 5
+        attn_metadata = SimpleNamespace(
+            num_tokens=num_tokens,
+            num_contexts=0,
+            tokens_per_block=2,
+            seq_lens_cuda=torch.tensor([2, 3], dtype=torch.long),
+            helix_total_input_len=torch.tensor([10, 20], dtype=torch.long),
+            kv_lens_cuda=torch.tensor([0, 0], dtype=torch.int32),
+            helix_position_offsets=torch.empty(num_tokens, dtype=torch.int32),
+            helix_is_inactive_rank=torch.empty(num_tokens, dtype=torch.bool),
+            helix_zero_kv_mask=torch.empty(num_tokens, dtype=torch.bool),
+        )
+        position_ids = torch.tensor([10, 11, 20, 21, 22], dtype=torch.long)
+
+        owner_counts = worker._helix_draft_owner_mask(attn_metadata,
+                                                      position_ids,
+                                                      batch_size)
+
+        torch.testing.assert_close(owner_counts,
+                                   torch.tensor([0, 1], dtype=torch.int32))
+        torch.testing.assert_close(
+            attn_metadata.helix_is_inactive_rank,
+            torch.tensor([True, True, True, True, False]))
+        torch.testing.assert_close(
+            attn_metadata.helix_zero_kv_mask,
+            torch.tensor([True, True, True, True, False]))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_helix_draft_owner_mask_cuda_graph_safe(self):
+        mapping = SimpleNamespace(cp_size=2,
+                                  cp_rank=1,
+                                  has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+
+        batch_size = 2
+        num_tokens = 5
+        attn_metadata = SimpleNamespace(
+            num_tokens=num_tokens,
+            num_contexts=0,
+            tokens_per_block=2,
+            seq_lens_cuda=torch.tensor([2, 3],
+                                       dtype=torch.long,
+                                       device="cuda"),
+            helix_total_input_len=torch.tensor([10, 20],
+                                               dtype=torch.long,
+                                               device="cuda"),
+            kv_lens_cuda=torch.tensor([0, 0],
+                                      dtype=torch.int32,
+                                      device="cuda"),
+            helix_position_offsets=torch.empty(num_tokens,
+                                               dtype=torch.int32,
+                                               device="cuda"),
+            helix_is_inactive_rank=torch.empty(num_tokens,
+                                               dtype=torch.bool,
+                                               device="cuda"),
+            helix_zero_kv_mask=torch.empty(num_tokens,
+                                           dtype=torch.bool,
+                                           device="cuda"),
+        )
+        position_ids = torch.tensor([10, 11, 20, 21, 22],
+                                    dtype=torch.long,
+                                    device="cuda")
+
+        for _ in range(3):
+            worker._helix_draft_owner_mask(attn_metadata, position_ids,
+                                           batch_size)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            worker._helix_draft_owner_mask(attn_metadata, position_ids,
+                                           batch_size)
+
+        attn_metadata.helix_is_inactive_rank.fill_(False)
+        attn_metadata.helix_zero_kv_mask.fill_(False)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            attn_metadata.helix_is_inactive_rank.cpu(),
+            torch.tensor([True, True, True, True, False]))
+        torch.testing.assert_close(
+            attn_metadata.helix_zero_kv_mask.cpu(),
+            torch.tensor([True, True, True, True, False]))
+
+    def test_helix_first_draft_delta_counts_next_token_owner(self):
+        mapping = SimpleNamespace(cp_size=2,
+                                  cp_rank=0,
+                                  has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=3),
+                           model_config=model_config)
+
+        # Target verify positions are decode indices [0, 1, 2, 3].
+        # Rank 0 owns [0, 1]. If all target verify tokens are accepted, the
+        # next MTP-layer current token is decode index 4, also owned by rank 0,
+        # so the local KV length must grow by one relative to the old window.
+        worker._saved_helix_position_offsets = torch.tensor(
+            [100, 101, 102, 103], dtype=torch.int32)
+        worker._saved_helix_is_inactive_rank = torch.tensor(
+            [False, False, True, True], dtype=torch.bool)
+        attn_metadata = SimpleNamespace(
+            num_tokens=4,
+            num_contexts=0,
+            tokens_per_block=2,
+            seq_lens_cuda=torch.tensor([4], dtype=torch.long),
+            helix_total_input_len=torch.tensor([100], dtype=torch.long),
+            helix_is_inactive_rank=torch.tensor(
+                [False, True, True, True], dtype=torch.bool),
+        )
+        num_accepted_tokens = torch.tensor([4], dtype=torch.int32)
+        mtp_input_owner_counts = torch.tensor([1], dtype=torch.int32)
+
+        kv_lens_delta = worker._helix_first_draft_kv_lens_delta(
+            attn_metadata, num_accepted_tokens, mtp_input_owner_counts,
+            batch_size=1)
+
+        torch.testing.assert_close(kv_lens_delta,
+                                   torch.tensor([1], dtype=torch.int32))
 
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []
