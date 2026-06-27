@@ -751,6 +751,8 @@ def run_disaggregated_test(example_dir,
                            extra_endpoints_test=None,
                            model_path=None,
                            cwd=None,
+                           disagg_schedule_style=None,
+                           post_client_test=None,
                            server_start_timeout=300):
     """Run disaggregated test using service discovery instead of MPI."""
     if mpi_disabled():
@@ -765,7 +767,8 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             server_start_timeout=server_start_timeout)
+                             server_start_timeout=server_start_timeout,
+                             schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
 
@@ -799,6 +802,8 @@ def run_disaggregated_test(example_dir,
             all_worker_procs,
             disagg_server.process,
             use_ray=True)
+        if post_client_test is not None:
+            post_client_test(server_url)
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
         shutil.rmtree(work_dir, ignore_errors=True)

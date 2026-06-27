@@ -45,8 +45,6 @@ using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::AttentionXqaWorkspaceSizes;
 using tensorrt_llm::common::op::KvCacheBuffers;
 
-
-
 template <typename T>
 struct SATypeConverter
 {
@@ -1055,7 +1053,6 @@ int AttentionOp::mlaGeneration(
     // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
     auto kv_scale_cache_buffer = KVBlockArray();
 
-    // Workspace pointer shift
     int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
     size_t offset = 0;
 
@@ -1240,7 +1237,6 @@ int AttentionOp::mlaGeneration(
         int* tile_scheduler_metadata_ptr = const_cast<int*>(params.flash_mla_tile_scheduler_metadata);
         int* num_splits_ptr = const_cast<int*>(params.flash_mla_num_splits);
 
-        // metadata should only be init once per iter, to fix later
         get_mla_metadata_func(mlaMetaDataParams, stream);
 
         Flash_fwd_mla_params flashMlaParams{};

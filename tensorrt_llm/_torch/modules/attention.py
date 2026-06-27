@@ -243,7 +243,7 @@ def _helix_post_process(
     """
     partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats,
                                                         zero_kv_mask)
-    if mapping.cp_config.get("use_nccl_for_alltoall", False):
+    if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL-based implementation using alltoall_helix.
         chunks = []
         for t in [partial_o, softmax_stats]:

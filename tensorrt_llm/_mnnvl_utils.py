@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -428,7 +428,7 @@ def init_helix_cp_comm(mapping: Mapping) -> None:
     Args:
         mapping: The mapping object containing parallelism configuration.
     """
-    if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", False):
+    if mapping.has_cp_helix() and not mapping.cp_config.get("use_nccl_for_alltoall", True):
         HelixCpMnnvlMemory.get_comm(mapping)
 
 

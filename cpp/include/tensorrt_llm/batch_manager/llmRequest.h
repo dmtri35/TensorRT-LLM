@@ -2245,9 +2245,12 @@ private:
             mState = LlmRequestState::kDISAGG_GENERATION_INIT;
         }
 
+        TLLM_CHECK_WITH_INFO(!inputTokens.empty() || mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY,
+            "Only generation-only requests may have empty input tokens");
+
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
-        // Helix CP empty ranks can own no input tokens.
+        // Helix CP empty ranks can own no input tokens for disaggregated generation.
         mLastTokens = inputTokens.empty() ? VecTokens(mSamplingConfig.beamWidth)
                                           : VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
 

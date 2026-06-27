@@ -511,6 +511,7 @@ private:
     void validate()
     {
         // Disaggregated generation requests can receive KV without local input tokens.
+        TLLM_CHECK(!mInputTokenIds.empty() || mDisaggRequestId.has_value());
         TLLM_CHECK(mMaxNewTokens > 0);
 
         // Show warning message unless mNumReturnSequences is the default value.
