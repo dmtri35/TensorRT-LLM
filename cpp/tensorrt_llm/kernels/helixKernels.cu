@@ -39,6 +39,29 @@ namespace
 {
 static constexpr int WARP_SIZE = 32;
 
+__device__ float2 convertLseToHelixStat(float const lse)
+{
+    if (!isfinite(lse))
+    {
+        return make_float2(-INFINITY, 0.0F);
+    }
+
+    // Helix combines normalized partial outputs using sum * exp(max - global_max).
+    // FlashMLA exposes log(sum(exp(scores))) for each row, so encode it as
+    // max=logZ and sum=1 to produce the same correction factor.
+    return make_float2(lse, 1.0F);
+}
+
+__global__ void convertFlashMlaLseToHelixStatsKernel(
+    float const* softmaxLse, float2* softmaxStats, int32_t totalStats)
+{
+    for (int32_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < totalStats; idx += blockDim.x * gridDim.x)
+    {
+        float const lse = softmaxLse[idx];
+        softmaxStats[idx] = convertLseToHelixStat(lse);
+    }
+}
+
 // Utility: warp-level corrected sum
 template <int N>
 __device__ inline void warpReduceCorrectedSum(float (&correctedVal)[N], float (&maxVal)[N], float (&sumVal)[N])
@@ -648,6 +671,22 @@ void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t
 
 INSTANTIATE_POST_PROC_NATIVE_V2(__half);
 INSTANTIATE_POST_PROC_NATIVE_V2(__nv_bfloat16);
+
+void invokeConvertFlashMlaLseToHelixStats(
+    float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads,
+    cudaStream_t stream)
+{
+    if (softmaxLse == nullptr || softmaxStats == nullptr)
+    {
+        return;
+    }
+
+    static constexpr int kThreadsPerBlock = 256;
+    int32_t const totalStats = batchSize * seqLenQ * numHeads;
+    int32_t const numBlocks = (totalStats + kThreadsPerBlock - 1) / kThreadsPerBlock;
+    convertFlashMlaLseToHelixStatsKernel<<<numBlocks, kThreadsPerBlock, 0, stream>>>(
+        softmaxLse, softmaxStats, totalStats);
+}
 
 } // namespace kernels
 

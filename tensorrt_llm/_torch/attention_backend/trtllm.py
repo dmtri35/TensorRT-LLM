@@ -215,6 +215,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     helix_zero_kv_mask_cpu: Optional[torch.Tensor] = None
     helix_total_input_len: Optional[torch.Tensor] = None
     helix_total_input_len_cpu: Optional[torch.Tensor] = None
+    helix_param_len_for_cpp: int = 0
     helix_spec_decoding_mask_ready: bool = False
     _helix_spec_decoding_owned_counts_cpu: Optional[torch.Tensor] = field(
         default=None, init=False, repr=False)
@@ -254,6 +255,20 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 return self.spec_decoding_position_offsets_cpp
             return offsets.view(self.max_num_requests, -1)
         return offsets
+
+    @property
+    def helix_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
+        offsets = self.helix_position_offsets
+        if offsets is None:
+            return None
+        return offsets[:self.helix_param_len_for_cpp]
+
+    @property
+    def helix_is_inactive_rank_for_cpp(self) -> Optional[torch.Tensor]:
+        inactive_rank = self.helix_is_inactive_rank
+        if inactive_rank is None:
+            return None
+        return inactive_rank[:self.helix_param_len_for_cpp]
 
     @property
     def max_context_length(self) -> int:
@@ -1570,8 +1585,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return torch.float8_e4m3fn
         return None
 
-    def _compute_flash_mla_metadata(self,
-                                    metadata: TrtllmAttentionMetadata) -> None:
+    def _compute_flash_mla_metadata(self, metadata: TrtllmAttentionMetadata,
+                                    num_q_tokens: int) -> None:
         num_generations = metadata.num_generations
         if num_generations <= 0:
             return
@@ -1582,7 +1597,16 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         generation_num_splits = metadata.flash_mla_num_splits[:num_generations +
                                                               1]
 
-        s_q = int(metadata.seq_lens[metadata.num_contexts].item())
+        s_q, remainder = divmod(num_q_tokens, num_generations)
+        if remainder != 0:
+            raise RuntimeError(
+                "FlashMLA generation metadata expects the query token count "
+                f"to divide the generation batch, got {num_q_tokens=} and "
+                f"{num_generations=}.")
+
+        num_q_heads = self.num_heads
+        if metadata.mapping is not None and metadata.mapping.has_cp_helix():
+            num_q_heads //= metadata.mapping.cp_size
 
         thop.compute_flash_mla_metadata(
             generation_kv_lens,
@@ -1590,7 +1614,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             generation_num_splits,
             num_generations,
             s_q,
-            self.num_heads,
+            num_q_heads,
             1,
             self.kv_lora_rank,
         )
@@ -1791,7 +1815,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 != AttentionInputType.context_only
                 and metadata.num_generations > 0
                 and not metadata._flash_mla_metadata_valid):
-            self._compute_flash_mla_metadata(metadata)
+            self._compute_flash_mla_metadata(metadata, q.shape[0])
             metadata._flash_mla_metadata_valid = True
 
         # Blackwell first_sparse: refresh at layer 0 before kernel launch.
@@ -1873,6 +1897,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
+        metadata.helix_param_len_for_cpp = (
+            q.shape[0] if self.is_mla_enable else batch_size)
 
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
@@ -2001,7 +2027,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_quant_orig
+            self.kv_scale_quant_orig,
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
@@ -2046,7 +2072,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_quant_orig
+            self.kv_scale_quant_orig,
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
@@ -2089,7 +2115,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_orig_quant
+            self.kv_scale_orig_quant,
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
@@ -2182,7 +2208,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self._ensure_rope_table_size(metadata.max_seq_len)
 
         helix_tensor_params = [
-            metadata.helix_position_offsets, metadata.helix_is_inactive_rank
+            metadata.helix_position_offsets[:fused_q.shape[0]]
+            if metadata.helix_position_offsets is not None else None,
+            metadata.helix_is_inactive_rank[:fused_q.shape[0]]
+            if metadata.helix_is_inactive_rank is not None else None,
         ]
 
         torch.ops.trtllm.mla_rope_generation(
@@ -2203,8 +2232,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            None,  # kv_scale_orig_quant
-            None,  # kv_scale_quant_orig
+            self.kv_scale_orig_quant,
+            self.kv_scale_quant_orig,
             out_scale,
             metadata.block_ids_per_seq,
             helix_tensor_params,

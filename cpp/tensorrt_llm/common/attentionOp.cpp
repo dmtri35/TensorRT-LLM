@@ -25,6 +25,7 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
+#include "tensorrt_llm/kernels/helixKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -1315,6 +1316,12 @@ int AttentionOp::mlaGeneration(
         else
         {
             TLLM_THROW("Unsupported data type for FlashMLA");
+        }
+
+        if (generation_params.softmax_stats != nullptr)
+        {
+            invokeConvertFlashMlaLseToHelixStats(
+                softmax_lse_ptr, generation_params.softmax_stats, batch_beam, s_q, num_q_heads, stream);
         }
     }
     else

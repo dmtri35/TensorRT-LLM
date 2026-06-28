@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -54,6 +54,10 @@ void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t
 // gathered_stats: [num_tokens, cp_size, num_heads, 2].
 template <typename T>
 void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t stream);
+
+void invokeConvertFlashMlaLseToHelixStats(
+    float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads,
+    cudaStream_t stream);
 
 } // namespace kernels
 
