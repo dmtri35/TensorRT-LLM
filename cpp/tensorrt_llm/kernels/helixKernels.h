@@ -55,10 +55,6 @@ void helixPostProcessNativeV1(HelixPostProcParams<T> const& params, cudaStream_t
 template <typename T>
 void helixPostProcessNativeV2(HelixPostProcParams<T> const& params, cudaStream_t stream);
 
-void invokeConvertFlashMlaLseToHelixStats(
-    float const* softmaxLse, float2* softmaxStats, int32_t batchSize, int32_t seqLenQ, int32_t numHeads,
-    cudaStream_t stream);
-
 } // namespace kernels
 
 TRTLLM_NAMESPACE_END

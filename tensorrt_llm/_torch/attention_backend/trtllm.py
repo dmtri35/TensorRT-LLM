@@ -1585,8 +1585,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             return torch.float8_e4m3fn
         return None
 
-    def _compute_flash_mla_metadata(self, metadata: TrtllmAttentionMetadata,
-                                    num_q_tokens: int) -> None:
+    def _compute_flash_mla_metadata(self,
+                                    metadata: TrtllmAttentionMetadata) -> None:
         num_generations = metadata.num_generations
         if num_generations <= 0:
             return
@@ -1597,16 +1597,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         generation_num_splits = metadata.flash_mla_num_splits[:num_generations +
                                                               1]
 
-        s_q, remainder = divmod(num_q_tokens, num_generations)
-        if remainder != 0:
-            raise RuntimeError(
-                "FlashMLA generation metadata expects the query token count "
-                f"to divide the generation batch, got {num_q_tokens=} and "
-                f"{num_generations=}.")
-
-        num_q_heads = self.num_heads
-        if metadata.mapping is not None and metadata.mapping.has_cp_helix():
-            num_q_heads //= metadata.mapping.cp_size
+        s_q = int(metadata.seq_lens[metadata.num_contexts].item())
 
         thop.compute_flash_mla_metadata(
             generation_kv_lens,
@@ -1614,7 +1605,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             generation_num_splits,
             num_generations,
             s_q,
-            num_q_heads,
+            self.num_heads,
             1,
             self.kv_lora_rank,
         )
@@ -1815,7 +1806,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 != AttentionInputType.context_only
                 and metadata.num_generations > 0
                 and not metadata._flash_mla_metadata_valid):
-            self._compute_flash_mla_metadata(metadata, q.shape[0])
+            self._compute_flash_mla_metadata(metadata)
             metadata._flash_mla_metadata_valid = True
 
         # Blackwell first_sparse: refresh at layer 0 before kernel launch.

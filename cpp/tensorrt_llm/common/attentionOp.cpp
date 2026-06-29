@@ -25,7 +25,6 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
-#include "tensorrt_llm/kernels/helixKernels.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "tensorrt_llm/kernels/sparseAttentionKernels.h"
@@ -45,6 +44,23 @@ using tensorrt_llm::common::op::AttentionOp;
 using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::AttentionXqaWorkspaceSizes;
 using tensorrt_llm::common::op::KvCacheBuffers;
+
+namespace
+{
+
+size_t getTllmGenMlaScratchWorkspaceSize(
+    size_t const elemSize, int32_t const headDim, int32_t const multiProcessorCount)
+{
+    static constexpr int32_t kScratchRowsPerCta = 256;
+    int const kNumBuffers = 3;
+    size_t workspaces[kNumBuffers];
+    workspaces[0] = elemSize * kScratchRowsPerCta * multiProcessorCount * headDim;
+    workspaces[1] = sizeof(float) * kScratchRowsPerCta * multiProcessorCount;
+    workspaces[2] = sizeof(float) * kScratchRowsPerCta * multiProcessorCount;
+    return tc::calculateTotalWorkspaceSize(workspaces, kNumBuffers);
+}
+
+} // namespace
 
 template <typename T>
 struct SATypeConverter
@@ -943,7 +959,9 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
 
         size_t const cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
         size_t const fmha_scheduler_counter = sizeof(uint32_t);
-        size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
+        int32_t const headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
+        size_t const fmha_multi_ctas_kv_scratch_size
+            = getTllmGenMlaScratchWorkspaceSize(size, headDim, mMultiProcessorCount);
 
         int const NUM_BUFFERS = 5;
         size_t workspaces[NUM_BUFFERS];
@@ -1081,9 +1099,14 @@ int AttentionOp::mlaGeneration(
     if (mUseTllmGen)
     {
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
-        void* scratchPtr = nextWorkspacePtr(workspace_byte_ptr, offset, getFmhaMultiCtasKvScratchSize());
+        void* scratchPtr = nextWorkspacePtr(
+            workspace_byte_ptr, offset, getTllmGenMlaScratchWorkspaceSize(sizeof(T), head_size, mMultiProcessorCount));
         TllmGenFmhaRunnerParams tllmRunnerParams{};
-        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Causal;
+
+        // Parameters to select kernels.
+        // MLA generation kernels use dense mask. For multi-token generation, TRTLLM-Gen applies causality by
+        // shrinking each token's effective KV length.
+        tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
         bool const useMultiCtasKvMode = mMultiBlockMode || generation_params.softmax_stats != nullptr;
         tllmRunnerParams.mMultiCtasKvMode = useMultiCtasKvMode;
@@ -1316,12 +1339,6 @@ int AttentionOp::mlaGeneration(
         else
         {
             TLLM_THROW("Unsupported data type for FlashMLA");
-        }
-
-        if (generation_params.softmax_stats != nullptr)
-        {
-            invokeConvertFlashMlaLseToHelixStats(
-                softmax_lse_ptr, generation_params.softmax_stats, batch_beam, s_q, num_q_heads, stream);
         }
     }
     else
