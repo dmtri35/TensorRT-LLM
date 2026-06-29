@@ -752,8 +752,7 @@ def run_disaggregated_test(example_dir,
                            model_path=None,
                            cwd=None,
                            disagg_schedule_style=None,
-                           post_client_test=None,
-                           server_start_timeout=300):
+                           post_client_test=None):
     """Run disaggregated test using service discovery instead of MPI."""
     if mpi_disabled():
         pytest.skip(
@@ -767,7 +766,6 @@ def run_disaggregated_test(example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
-                             server_start_timeout=server_start_timeout,
                              schedule_style=disagg_schedule_style)
 
     server_host = config.get("hostname", "localhost")
@@ -795,7 +793,7 @@ def run_disaggregated_test(example_dir,
             test_desc,
             num_iters,
             run_env,
-            server_start_timeout,
+            300,  # timeout
             prompt_file,
             extra_endpoints_test,
             server_url,
@@ -2270,24 +2268,22 @@ def test_llama4_long_context_kv_cache_overflow(disaggregated_test_root,
                              cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.timeout(2400)
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("prompt_file", ["prompts.json", "long_prompts.json"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-bf16'],
                          indirect=True)
 def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
-        deepseek_v3_model_root, prompt_file):
+        deepseek_v3_model_root):
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/bf16")
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           prompt_file=prompt_file,
+                           prompt_file="long_prompts.json",
                            model_path=deepseek_v3_model_root,
-                           cwd=llm_venv.get_working_directory(),
-                           server_start_timeout=1200)
+                           cwd=llm_venv.get_working_directory())
+
 
 @skip_pre_blackwell
 @pytest.mark.skip_less_device(4)

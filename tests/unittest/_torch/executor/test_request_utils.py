@@ -94,6 +94,11 @@ def test_merge_helix_requests_with_padding():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
+        # Round-robin block distribution across 4 CP ranks (7 blocks total, 2 tokens/block):
+        #   rank 0 owns blocks {0, 4} -> tokens [1,2, 9,10]
+        #   rank 1 owns blocks {1, 5} -> tokens [3,4, 11,12]
+        #   rank 2 owns blocks {2, 6} -> tokens [5,6, 13]  (block 6 is the last block; padding stripped)
+        #   rank 3 owns block  {3}    -> tokens [7,8]
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 9, 10]
         elif rank == 1:
@@ -140,19 +145,22 @@ def test_merge_helix_requests_without_padding():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
+        # Round-robin block distribution across 2 CP ranks (3 blocks total, 4 tokens/block):
+        #   rank 0 owns blocks {0, 2} -> tokens [1,2,3,4, 9,10,11,12]
+        #   rank 1 owns block  {1}    -> tokens [5,6,7,8]
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 3, 4, 9, 10, 11, 12]
         else:
             assert llm_request.get_tokens(0) == [5, 6, 7, 8]
 
 
-def test_merge_helix_requests_empty_ranks():
-    """CP ranks without owned blocks produce an empty token list."""
+def test_merge_helix_requests_insufficient_blocks_error():
+    """Test merge_helix_requests raises error when insufficient blocks."""
     tokens_per_block = 4
 
-    input_tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+    # Create input with only 12 tokens. This creates 3 blocks which is fewer than 4 CP ranks.
     executor_request = trtllm.Request(
-        input_token_ids=input_tokens,
+        input_token_ids=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         max_tokens=12,
         streaming=False,
         sampling_config=trtllm.SamplingConfig(),
@@ -163,30 +171,18 @@ def test_merge_helix_requests_empty_ranks():
         request=executor_request,
     )
 
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-
-    expected_tokens = {
-        0: [1, 2, 3, 4],
-        1: [5, 6, 7, 8],
-        2: [9, 10, 11, 12],
-        3: [],
-    }
+    # Loop over ranks 0, 1, 2, 3 and verify that all ranks throw assertion.
     for rank in range(4):
-        result = merge_helix_requests(
-            [request_item],
-            cp_rank=rank,
-            cp_size=4,
-            tokens_per_block=tokens_per_block,
-            exclude_last_generation_logits=False,
-        )
-
-        assert len(result) == 1
-        llm_request = result[0]
-        assert isinstance(llm_request, LlmRequest)
-        assert llm_request.request_id == 1
-        assert llm_request.get_tokens(0) == expected_tokens[rank]
-        assert llm_request.total_input_len_cp == len(input_tokens)
-        assert llm_request.seqlen_this_rank_cp == len(expected_tokens[rank])
+        with pytest.raises(
+            ValueError, match="There aren't enough tokens to get at least one block per CP rank"
+        ):
+            merge_helix_requests(
+                [request_item],
+                cp_rank=rank,
+                cp_size=4,
+                tokens_per_block=tokens_per_block,
+                exclude_last_generation_logits=False,
+            )
 
 
 @patch("tensorrt_llm._torch.pyexecutor.request_utils.executor_request_to_llm_request")
@@ -244,6 +240,11 @@ def test_merge_requests_with_helix_cp_config():
 
         assert isinstance(llm_request, LlmRequest)
         assert llm_request.request_id == 1
+        # Round-robin block distribution across 4 CP ranks (7 blocks total, 2 tokens/block):
+        #   rank 0 owns blocks {0, 4} -> tokens [1,2, 9,10]
+        #   rank 1 owns blocks {1, 5} -> tokens [3,4, 11,12]
+        #   rank 2 owns blocks {2, 6} -> tokens [5,6, 13]  (block 6 is the last block; padding stripped)
+        #   rank 3 owns block  {3}    -> tokens [7,8]
         if rank == 0:
             assert llm_request.get_tokens(0) == [1, 2, 9, 10]
         elif rank == 1:

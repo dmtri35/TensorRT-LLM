@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,31 +59,16 @@ __device__ inline void warpReduceCorrectedSum(float (&correctedVal)[N], float (&
 #pragma unroll
     for (int nn = 0; nn < N; ++nn)
     {
-        corrected_max_exp[nn] = (sumVal[nn] > 0.F && isfinite(maxVal[nn]) && isfinite(warp_max))
-            ? sumVal[nn] * expf(maxVal[nn] - warp_max)
-            : 0.F;
+        corrected_max_exp[nn] = sumVal[nn] * expf(maxVal[nn] - warp_max);
         global_sum += corrected_max_exp[nn];
     }
 #pragma unroll
     for (int offset = 1; offset < WARP_SIZE; offset *= 2)
-    {
         global_sum += __shfl_xor_sync(0xffffffff, global_sum, offset);
-    }
-    if (!(global_sum > 0.F) || !isfinite(global_sum))
-    {
-#pragma unroll
-        for (int nn = 0; nn < N; ++nn)
-        {
-            correctedVal[nn] = 0.F;
-        }
-        return;
-    }
     auto norm = 1.F / global_sum;
 #pragma unroll
     for (int nn = 0; nn < N; ++nn)
-    {
         correctedVal[nn] = corrected_max_exp[nn] * norm;
-    }
 }
 
 static constexpr int MAX_CP_VAL_PER_THREAD = 8;
@@ -189,10 +174,6 @@ __global__ void helix_postprocess_kernel(
 #pragma unroll
             for (int cp_idx = 0; cp_idx < NUM_PRE_LOAD; ++cp_idx)
             {
-                if (corr_vals[cp_idx] == 0.F || !isfinite(corr_vals[cp_idx]))
-                {
-                    continue;
-                }
 #pragma unroll
                 for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
                 {
@@ -211,10 +192,6 @@ __global__ void helix_postprocess_kernel(
 #pragma unroll
         for (int cp_idx = 0; cp_idx < NUM_PRE_LOAD && cp_idx < cp_size; ++cp_idx)
         {
-            if (corr_vals[cp_idx] == 0.F || !isfinite(corr_vals[cp_idx]))
-            {
-                continue;
-            }
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
@@ -346,10 +323,6 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
         for (int cp_idx = 0; cp_idx < NUM_PRE_LOAD; ++cp_idx)
         {
-            if (corr_vals[cp_idx] == 0.F || !isfinite(corr_vals[cp_idx]))
-            {
-                continue;
-            }
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
@@ -368,10 +341,6 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
     for (int cp_idx = 0; cp_idx < NUM_PRE_LOAD && cp_idx < cp_size; ++cp_idx)
     {
-        if (corr_vals[cp_idx] == 0.F || !isfinite(corr_vals[cp_idx]))
-        {
-            continue;
-        }
 #pragma unroll
         for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
         {
@@ -500,10 +469,6 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
         for (int cp_idx = 0; cp_idx < NUM_PRE_LOAD; ++cp_idx)
         {
-            if (corr_vals[cp_idx] == 0.F || !isfinite(corr_vals[cp_idx]))
-            {
-                continue;
-            }
 #pragma unroll
             for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
             {
@@ -522,10 +487,6 @@ __global__ void __launch_bounds__(MAX_THREADS) helix_postprocess_kernel_native_v
 #pragma unroll
     for (int cp_idx = 0; cp_idx < NUM_PRE_LOAD && cp_idx < cp_size; ++cp_idx)
     {
-        if (corr_vals[cp_idx] == 0.F || !isfinite(corr_vals[cp_idx]))
-        {
-            continue;
-        }
 #pragma unroll
         for (int o_idx = 0; o_idx < NUM_O_PER_THREAD; ++o_idx)
         {

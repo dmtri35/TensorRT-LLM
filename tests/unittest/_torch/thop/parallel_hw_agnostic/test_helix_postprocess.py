@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -288,40 +288,6 @@ class TestHelixPostProcess(unittest.TestCase):
             native_v1=native_v1,
             native_v2=native_v2,
         )
-
-    def test_helix_postprocess_empty_rank_noop(self):
-        device = torch.device("cuda")
-        cp_size, num_tokens, num_heads, kv_lora_rank = 4, 8, 2, 64
-        dtype = torch.float16
-        scale = 1.0
-
-        gathered_o = torch.empty(
-            cp_size, num_tokens, num_heads, kv_lora_rank, dtype=dtype, device=device
-        ).uniform_(-1, 1)
-        gathered_stats = torch.empty(
-            cp_size, num_tokens, num_heads, 2, dtype=torch.float32, device=device
-        )
-        gathered_o_max = torch.max(gathered_o, dim=-1, keepdim=True)[0]
-        gathered_stats[..., 0] = gathered_o_max[..., 0]
-        gathered_stats[..., 1] = torch.sum(torch.exp(gathered_o - gathered_o_max), dim=-1)
-
-        empty = cp_size - 1
-        gathered_stats[empty, ..., 0] = float("-inf")
-        gathered_stats[empty, ..., 1] = 0.0
-        gathered_o[empty] = 0.0
-
-        gathered_o_v = gathered_o.view(cp_size, num_tokens, num_heads * kv_lora_rank)
-        output = torch.ops.trtllm.helix_post_process(gathered_o_v, gathered_stats, scale)
-
-        expected = baseline(
-            gathered_o_v[:empty].contiguous(),
-            gathered_stats[:empty].contiguous(),
-            kv_lora_rank,
-            scale,
-        )
-
-        assert torch.isfinite(output).all()
-        torch.testing.assert_close(output, expected, atol=1e-3, rtol=1e-2)
 
     def test_helix_postprocess_invalid_inputs(self):
         """Test error handling for invalid inputs (non-native)"""

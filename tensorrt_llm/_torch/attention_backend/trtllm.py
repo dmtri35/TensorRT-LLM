@@ -71,79 +71,6 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
     return mask
 
 
-def _build_helix_spec_decoding_packed_mask(
-        helix_is_inactive_rank: torch.Tensor,
-        seq_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build a TllmGen custom mask for Helix's compact local KV suffix.
-
-    Helix stores only this rank's owned verify-window tokens in the local KV
-    suffix. The custom mask is indexed by compact local suffix position, while
-    causal validity is determined by the token's global verify-window offset.
-    """
-    seq_lens_cpu = seq_lens.to(device='cpu', dtype=torch.long)
-    batch_size = int(seq_lens_cpu.numel())
-    max_seq_len = int(seq_lens_cpu.max().item()) if batch_size > 0 else 0
-    num_blocks = math.ceil(max_seq_len / 32) if max_seq_len > 0 else 0
-    packed_mask = torch.zeros((batch_size, max_seq_len, num_blocks),
-                              dtype=torch.int,
-                              device='cpu')
-    owned_counts = torch.zeros((batch_size, ), dtype=torch.int, device='cpu')
-    inactive_cpu = helix_is_inactive_rank.to(device='cpu', dtype=torch.bool)
-
-    token_offset = 0
-    for batch_idx, seq_len_tensor in enumerate(seq_lens_cpu):
-        seq_len = int(seq_len_tensor.item())
-        owned_suffix_idx = 0
-        owned_offsets: list[tuple[int, int]] = []
-        for local_token_idx in range(seq_len):
-            if not bool(inactive_cpu[token_offset + local_token_idx].item()):
-                owned_offsets.append((local_token_idx, owned_suffix_idx))
-                owned_suffix_idx += 1
-
-        owned_counts[batch_idx] = owned_suffix_idx
-        for query_idx in range(seq_len):
-            for local_token_idx, suffix_idx in owned_offsets:
-                if local_token_idx <= query_idx:
-                    block_idx = suffix_idx // 32
-                    packed_mask[batch_idx, query_idx, block_idx] = (
-                        packed_mask[batch_idx, query_idx, block_idx]
-                        | (1 << (suffix_idx % 32)))
-        token_offset += seq_len
-
-    return packed_mask, owned_counts
-
-
-def _build_helix_owned_token_counts(
-        helix_is_inactive_rank: torch.Tensor,
-        seq_lens: torch.Tensor) -> torch.Tensor:
-    seq_lens_cpu = seq_lens.to(device='cpu', dtype=torch.long)
-    inactive_cpu = helix_is_inactive_rank.to(device='cpu', dtype=torch.bool)
-    seq_ids = torch.repeat_interleave(
-        torch.arange(seq_lens_cpu.numel(), dtype=torch.long), seq_lens_cpu)
-    active_tokens = ~inactive_cpu[:seq_ids.numel()]
-    return torch.bincount(seq_ids[active_tokens],
-                          minlength=seq_lens_cpu.numel()).to(torch.int)
-
-
-def _build_helix_spec_decoding_position_offsets(
-        num_seqs: int, max_generation_length: int) -> torch.Tensor:
-    return torch.arange(max_generation_length,
-                        dtype=torch.int).unsqueeze(0).repeat(num_seqs, 1)
-
-
-def _should_use_helix_spec_decoding_mask(
-        is_mla_enable: bool, attention_input_type: AttentionInputType,
-        mask_ready: bool, sm: int) -> bool:
-    return False
-
-
-def _should_use_helix_owned_token_counts(
-        is_spec_decoding_enabled: bool,
-        helix_owned_token_counts_ready: bool,
-) -> bool:
-    return is_spec_decoding_enabled or helix_owned_token_counts_ready
-
-
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
@@ -211,14 +138,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # token. Inactive ranks use the query token without appending it to local KV.
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
-    helix_zero_kv_mask: Optional[torch.Tensor] = None
-    helix_zero_kv_mask_cpu: Optional[torch.Tensor] = None
     helix_total_input_len: Optional[torch.Tensor] = None
     helix_total_input_len_cpu: Optional[torch.Tensor] = None
     helix_param_len_for_cpp: int = 0
-    helix_spec_decoding_mask_ready: bool = False
-    _helix_spec_decoding_owned_counts_cpu: Optional[torch.Tensor] = field(
-        default=None, init=False, repr=False)
 
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
@@ -528,18 +450,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 device='cpu',
                 pin_memory=prefer_pinned(),
             )
-            self.helix_zero_kv_mask = self.get_empty(
-                buffers,
-                (self.max_num_tokens, ),
-                cache_name="helix_zero_kv_mask",
-                dtype=torch.bool,
-                capture_graph=capture_graph,
-            )
-            self.helix_zero_kv_mask_cpu = torch.empty_like(
-                self.helix_zero_kv_mask,
-                device='cpu',
-                pin_memory=prefer_pinned(),
-            )
             self.helix_total_input_len = self.get_empty(
                 buffers,
                 (self.max_num_sequences, ),
@@ -575,158 +485,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return torch.bincount(seq_ids[active_tokens],
                               minlength=self.num_seqs).to(torch.int)
 
-    def _ensure_helix_spec_decoding_tensor_buffers(
-            self, max_generation_length: int, num_blocks: int) -> None:
-        if max_generation_length == 0:
-            return
-
-        device = self.helix_position_offsets.device
-        if (self.spec_decoding_position_offsets is None
-                or self.spec_decoding_position_offsets.shape[0]
-                < self.max_num_requests
-                or self.spec_decoding_position_offsets.shape[1]
-                < max_generation_length):
-            self.spec_decoding_position_offsets = torch.empty(
-                [self.max_num_requests, max_generation_length],
-                dtype=torch.int,
-                device=device,
-            )
-        if (self.spec_decoding_packed_mask is None
-                or self.spec_decoding_packed_mask.shape[0]
-                < self.max_num_requests
-                or self.spec_decoding_packed_mask.shape[1]
-                < max_generation_length
-                or self.spec_decoding_packed_mask.shape[2] < num_blocks):
-            self.spec_decoding_packed_mask = torch.empty(
-                [self.max_num_requests, max_generation_length, num_blocks],
-                dtype=torch.int,
-                device=device,
-            )
-        if (self.spec_decoding_generation_lengths is None
-                or self.spec_decoding_generation_lengths.shape[0]
-                < self.max_num_requests):
-            self.spec_decoding_generation_lengths = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int,
-                device=device,
-            )
-
-    def _ensure_helix_spec_decoding_blackwell_buffers(
-            self, kv_lens: torch.Tensor,
-            first_sparse_offsets: torch.Tensor) -> None:
-        device = self.helix_position_offsets.device
-        if (self.spec_decoding_bl_tree_mask_offset is None
-                or self.spec_decoding_bl_tree_mask_offset.shape[0]
-                < self.max_num_requests):
-            self.spec_decoding_bl_tree_mask_offset = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int64,
-                device=device,
-            )
-        if (self.spec_bl_tree_first_sparse_mask_offset_kv is None
-                or self.spec_bl_tree_first_sparse_mask_offset_kv.shape[0]
-                < self.max_num_requests):
-            self.spec_bl_tree_first_sparse_mask_offset_kv = torch.empty(
-                [self.max_num_requests],
-                dtype=torch.int32,
-                device=device,
-            )
-
-        max_kv_len = int(kv_lens[:self.num_seqs].max().item())
-        min_first_sparse_offset = int(first_sparse_offsets.min().item())
-        tile_size_kv = 128
-        tile_size_q = 128
-        num_instances_q = 1
-        num_instances_kv = 2
-        tile_size_kv_per_cta = tile_size_kv * num_instances_kv
-        tile_size_q_per_cta = tile_size_q * num_instances_q
-        max_num_custom_mask_tiles_kv = self.compute_max_num_custom_mask_tiles_kv_upper_bound(
-            max_kv_len, min_first_sparse_offset, tile_size_kv_per_cta)
-        max_seq_len_q = int(self.seq_lens[:self.num_seqs].max().item())
-        max_num_tiles_q = math.ceil(
-            (max_seq_len_q * self.num_heads_per_kv) / tile_size_q_per_cta)
-        mask_size = int(self.max_num_requests * max_num_tiles_q *
-                        max_num_custom_mask_tiles_kv * num_instances_q *
-                        num_instances_kv * tile_size_q * tile_size_kv / 32)
-        if (self.spec_decoding_bl_tree_mask is None
-                or self.spec_decoding_bl_tree_mask.numel() < mask_size):
-            self.spec_decoding_bl_tree_mask = torch.zeros(
-                mask_size,
-                dtype=torch.uint32,
-                device=device,
-            )
-        else:
-            self.spec_decoding_bl_tree_mask[:mask_size].zero_()
-
-    def _update_helix_spec_decoding_metadata(
-            self, helix_is_inactive_rank: List[bool],
-            build_spec_decoding_mask: bool) -> None:
-        self.helix_spec_decoding_mask_ready = False
-        self._helix_spec_decoding_owned_counts_cpu = None
-        if self.seq_lens_kv is None or self.num_seqs == 0:
-            return
-
-        seq_lens = self.seq_lens_kv[:self.num_seqs]
-        max_generation_length = int(seq_lens.max().item())
-        if max_generation_length <= 1:
-            return
-
-        total_q_len = int(seq_lens.sum().item())
-        if len(helix_is_inactive_rank) < total_q_len:
-            return
-
-        inactive_flags = torch.tensor(helix_is_inactive_rank[:total_q_len],
-                                      dtype=torch.bool)
-        self._helix_spec_decoding_owned_counts_cpu = (
-            _build_helix_owned_token_counts(inactive_flags, seq_lens))
-        if not build_spec_decoding_mask:
-            return
-
-        packed_mask, owned_counts = _build_helix_spec_decoding_packed_mask(
-            inactive_flags, seq_lens)
-        num_blocks = packed_mask.shape[2]
-        self._ensure_helix_spec_decoding_tensor_buffers(
-            max_generation_length, num_blocks)
-
-        position_offsets = _build_helix_spec_decoding_position_offsets(
-            self.num_seqs, max_generation_length)
-        self.spec_decoding_position_offsets[:self.num_seqs, :
-                                            max_generation_length].copy_(
-                                                maybe_pin_memory(
-                                                    position_offsets),
-                                                non_blocking=True)
-        self.spec_decoding_packed_mask[:self.num_seqs, :
-                                       max_generation_length, :
-                                       num_blocks].copy_(maybe_pin_memory(
-                                           packed_mask),
-                                                         non_blocking=True)
-        self.spec_decoding_generation_lengths[:self.num_seqs].copy_(
-            maybe_pin_memory(seq_lens.to(dtype=torch.int)), non_blocking=True)
-        self._helix_spec_decoding_owned_counts_cpu = owned_counts
-        self.helix_spec_decoding_mask_ready = True
-
-    def _prepare_helix_spec_decoding_sparse_offsets(
-            self, kv_lens: torch.Tensor) -> None:
-        if (not self.helix_spec_decoding_mask_ready
-                or self._helix_spec_decoding_owned_counts_cpu is None):
-            return
-
-        owned_counts = self._helix_spec_decoding_owned_counts_cpu[:
-                                                                  self.num_seqs]
-        first_sparse_offsets = kv_lens[:self.num_seqs].to(
-            dtype=torch.int) - owned_counts
-        self._ensure_helix_spec_decoding_blackwell_buffers(
-            kv_lens, first_sparse_offsets)
-        self.spec_bl_tree_first_sparse_mask_offset_kv[:self.num_seqs].copy_(
-            maybe_pin_memory(first_sparse_offsets), non_blocking=True)
-
     def update_helix_param(
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
-        helix_zero_kv_mask: Optional[List[bool]] = None,
         helix_total_input_len: Optional[List[int]] = None,
-        build_spec_decoding_mask: bool = True,
     ) -> None:
         """
         Update helix parameters by copying into static buffers for CUDA graph compatibility.
@@ -734,9 +497,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         Args:
             helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
             helix_is_inactive_rank: Whether the current rank is inactive with shape (num_tokens,).
-            helix_zero_kv_mask: Whether this rank has zero local KV for each query token.
             helix_total_input_len: Global input length before decode, with shape (batch_size,).
-            build_spec_decoding_mask: Whether to build Helix's spec-dec packed mask.
         """
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
@@ -752,13 +513,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_is_inactive_rank[:num_flags].copy_(
                 self.helix_is_inactive_rank_cpu[:num_flags], non_blocking=True)
 
-        if helix_zero_kv_mask is not None and self.helix_zero_kv_mask is not None:
-            num_flags = len(helix_zero_kv_mask)
-            self.helix_zero_kv_mask_cpu[:num_flags].copy_(
-                torch.tensor(helix_zero_kv_mask, dtype=torch.bool))
-            self.helix_zero_kv_mask[:num_flags].copy_(
-                self.helix_zero_kv_mask_cpu[:num_flags], non_blocking=True)
-
         if helix_total_input_len is not None and self.helix_total_input_len is not None:
             batch_size = len(helix_total_input_len)
             self.helix_total_input_len_cpu[:batch_size].copy_(
@@ -766,9 +520,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.helix_total_input_len[:batch_size].copy_(
                 self.helix_total_input_len_cpu[:batch_size],
                 non_blocking=True)
-        if helix_is_inactive_rank is not None:
-            self._update_helix_spec_decoding_metadata(
-                helix_is_inactive_rank, build_spec_decoding_mask)
 
     def prepare(self) -> None:
         super().prepare()
@@ -815,12 +566,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             kv_lens = cached_token_lens.clone()
             total_q_len = int(self.seq_lens_kv[:self.num_seqs].sum().item())
-            use_owned_token_counts = (
-                _should_use_helix_owned_token_counts(
-                    self.is_spec_decoding_enabled,
-                    self._helix_spec_decoding_owned_counts_cpu is not None)
-                and self.helix_is_inactive_rank_cpu is not None
-                and self.helix_is_inactive_rank_cpu.numel() >= total_q_len)
+            use_owned_token_counts = (self.helix_is_inactive_rank_cpu
+                                      is not None
+                                      and self.helix_is_inactive_rank_cpu.numel()
+                                      >= total_q_len)
             if use_owned_token_counts:
                 owned_counts = self._helix_owned_token_counts()
                 kv_lens += owned_counts
@@ -838,7 +587,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens_cuda[:self.num_seqs].copy_(maybe_pin_memory(
             kv_lens[:self.num_seqs]),
                                                 non_blocking=True)
-        self._prepare_helix_spec_decoding_sparse_offsets(kv_lens)
         # total kv lens for context requests and generation requests, without extra tokens
         self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
         self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.

@@ -252,19 +252,20 @@ def partition_context_for_helix(
     Returns:
         Tuple of (input_ids_this_rank, position_ids_this_rank, input_len, padding_len).
 
-        CP ranks that own no blocks return empty token and position lists.
-
     Raises:
-        ValueError: If the prompt is empty (no blocks to distribute).
+        ValueError: If there aren't enough tokens for at least one block per CP rank.
     """
     all_input_ids = torch.tensor(input_token_ids, dtype=torch.int64).unsqueeze(0)
     input_len = all_input_ids.shape[-1]
 
     num_total_blocks = (input_len + tokens_per_block - 1) // tokens_per_block
-    if num_total_blocks == 0:
+    if num_total_blocks < cp_size:
         raise ValueError(
-            "Cannot partition an empty prompt for Helix CP: num_total_blocks == 0."
+            f"There aren't enough tokens to get at least one block per CP rank. "
+            f"num_total_blocks {num_total_blocks} < num_cp_ranks {cp_size}. "
+            f"Please use smaller tokens_per_block for KV cache or reduce the number of CP ranks."
         )
+
     # Pad the last (partial) block so every block has exactly tokens_per_block tokens.
     padding_len = 0
     if input_len % tokens_per_block != 0:
@@ -273,19 +274,19 @@ def partition_context_for_helix(
         all_input_ids = torch.cat((all_input_ids, padding_ids), dim=-1)
     all_position_ids = torch.arange(0, input_len + padding_len, dtype=torch.int64).unsqueeze(0)
 
+    # Round-robin block assignment across CP ranks: rank r owns blocks {r, r+cp_size, r+2*cp_size, ...}.
+    # This must agree with the C++ KV cache split kernels (cacheSplitConcat.cu) so that the input
+    # tokens this rank processes correspond to the KV blocks it received from the context server.
     input_id_blocks = list(all_input_ids.split(tokens_per_block, dim=-1))
     position_id_blocks = list(all_position_ids.split(tokens_per_block, dim=-1))
 
-    my_input_blocks = input_id_blocks[cp_rank::cp_size]
-    my_position_blocks = position_id_blocks[cp_rank::cp_size]
-    if len(my_input_blocks) == 0:
-        return [], [], input_len, padding_len
-
-    input_ids_this_rank = torch.cat(my_input_blocks, dim=-1).flatten().tolist()
+    input_ids_this_rank = torch.cat(input_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
     position_ids_this_rank = (
-        torch.cat(my_position_blocks, dim=-1).flatten().tolist()
+        torch.cat(position_id_blocks[cp_rank::cp_size], dim=-1).flatten().tolist()
     )
 
+    # The (single) padded block is the global last block; under round-robin it is owned by rank
+    # (num_total_blocks - 1) % cp_size, and is the last local block on that rank. Strip its padding.
     last_block_owner = (num_total_blocks - 1) % cp_size
     if cp_rank == last_block_owner and padding_len > 0:
         input_ids_this_rank = input_ids_this_rank[:-padding_len]

@@ -1168,8 +1168,6 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
     }
     cachePtrs.insert(cachePtrs.end(), prefixLayerNum.begin(), prefixLayerNum.end());
     bool const isWindow = windowSizes.size() > 1;
-    TLLM_CHECK_WITH_INFO(!isWindow || targetRankInfo.mDomainCPSize == 1,
-        "Variable-window KV cache split with context parallelism is not supported");
 
     runtime::BufferManager::IBufferPtr PtrsDeviceBuffer
         = bufferManager.gpu(cachePtrs.size(), nvinfer1::DataType::kINT64);
@@ -1519,8 +1517,6 @@ void concatKVCache(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlo
     TLLM_CHECK(PtrsDeviceBuffer->getSizeInBytes() == cachePtrs.size() * sizeof(uint64_t));
     bufferManager.copy(cachePtrs.data(), *PtrsDeviceBuffer, runtime::MemoryType::kCPU);
     bool const isWindow = windowSizes.size() > 1;
-    TLLM_CHECK_WITH_INFO(!isWindow || targetRankInfo.mDomainCPSize == 1,
-        "Variable-window KV cache concat with context parallelism is not supported");
     runtime::BufferManager::IBufferPtr windowInfoDeviceBuffer;
     std::vector<SizeType32> windowInfoHostBuffer;
     if (isWindow)

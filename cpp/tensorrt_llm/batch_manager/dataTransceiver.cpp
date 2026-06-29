@@ -857,33 +857,26 @@ public:
         if (!mCacheTransferLayer.getCacheManager()->getBlockManager().isVariableWindow())
         {
             auto* cacheManager = mCacheTransferLayer.getCacheManager();
+            auto beam = 0;
             auto const srcPpSize = destCacheState.getParallelConfig().mPipelineParallelism;
             auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest,
                 destCacheState.getEnableBlockReuse(), destCacheState.getEnablePartialReuse(),
                 /*recvSideHasCP=*/false, srcPpSize);
 
+            auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
+            auto lastBlockKey
+                = BlockKey(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
+            auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
+            SizeType32 startTokenIdx = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
+            SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
+            auto extraKeys = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
+            lastBlockKey.extraKeys = std::move(extraKeys);
+            // Compute indexFromEnd from the number of requested blocks
             int32_t requestedBlockSize = requestedBlockRange.getBlockIdsPerWindow().begin()->second.size();
-            // Helix CP empty ranks still send RequestInfo, but request no blocks.
-            if (requestedBlockSize > 0)
-            {
-                auto const beam = 0;
-                auto const& uniqueTokens = llmRequest.getUniqueTokens(beam);
-                auto lastBlockKey = BlockKey(
-                    llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(), uniqueTokens);
-                if (llmRequest.getInputTokensExtraIds().has_value())
-                {
-                    auto tokensPerBlock = cacheManager->getBlockManager().getTokensPerBlock();
-                    SizeType32 startTokenIdx
-                        = static_cast<SizeType32>(uniqueTokens.size() / tokensPerBlock) * tokensPerBlock;
-                    SizeType32 endTokenIdx = static_cast<SizeType32>(uniqueTokens.size());
-                    auto extraKeys
-                        = kv_cache_manager::generateBlockHashExtraKeys(llmRequest, startTokenIdx, endTokenIdx);
-                    lastBlockKey.extraKeys = std::move(extraKeys);
-                }
-                int32_t indexFromEnd = requestedBlockSize - 1;
+            TLLM_CHECK_WITH_INFO(requestedBlockSize > 0, "requestedBlockSize must be > 0");
+            int32_t indexFromEnd = requestedBlockSize - 1;
 
-                requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
-            }
+            requestInfo = RequestInfo(requestId, mSelfState, indexFromEnd, lastBlockKey);
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);

@@ -433,9 +433,7 @@ class AttentionMetadata:
         self,
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
-        helix_zero_kv_mask: Optional[List[bool]] = None,
         helix_total_input_len: Optional[List[int]] = None,
-        build_spec_decoding_mask: bool = True,
     ) -> None:
         """
         Hook to be called when using helix parallelism.

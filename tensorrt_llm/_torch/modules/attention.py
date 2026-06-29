@@ -2,8 +2,7 @@ import functools
 import math
 import os
 import weakref
-from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union, cast
+from typing import List, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -145,77 +144,6 @@ def attn_custom_op_inplace(
     )
 
 
-def _helix_zero_kv_mask(attn_metadata: AttentionMetadata,
-                        num_tokens: int) -> Optional[torch.Tensor]:
-    """Return the precomputed zero-local-KV token mask for this CP rank."""
-    helix_zero_kv_mask = getattr(attn_metadata, "helix_zero_kv_mask", None)
-    if helix_zero_kv_mask is not None:
-        return helix_zero_kv_mask[:num_tokens]
-    return None
-
-
-def _helix_sanitize_empty_kv(
-    partial_o: torch.Tensor,
-    softmax_stats: torch.Tensor,
-    zero_kv_mask: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Force zero-local-KV rows to a no-op contribution for the Helix combine.
-
-    A CP rank that owns no KV blocks for a token attends to zero keys, so the
-    attention kernel normalizes by a zero softmax sum and yields NaN. The combine
-    weights each rank by sum * exp(max - global_max), so such rows must contribute
-    softmax_stats of (-inf, 0) and a zeroed partial_o to act as a no-op. The rows
-    are selected by zero_kv_mask, which is robust regardless of what the kernel
-    wrote. Passing None disables sanitization.
-
-    Args:
-        partial_o: Partial attention output, shape [num_tokens, ...].
-        softmax_stats: Per (token, head) (max, sum), shape [num_tokens, num_heads, 2].
-        zero_kv_mask: Bool tensor of shape [num_tokens], True where this rank has
-            zero local KV.
-    """
-    if zero_kv_mask is None:
-        return partial_o, softmax_stats
-    return _helix_compiled_sanitize_empty_kv(partial_o, softmax_stats,
-                                             zero_kv_mask)
-
-
-@torch.compile(options={"max-autotune": True})
-def _helix_compiled_sanitize_empty_kv(
-    partial_o: torch.Tensor,
-    softmax_stats: torch.Tensor,
-    zero_kv_mask: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = partial_o.shape[0]
-    mask = zero_kv_mask.reshape(-1)[:num_tokens]
-    partial_o_mask = mask.view((num_tokens, ) + (1, ) * (partial_o.dim() - 1))
-    softmax_mask = mask.view((num_tokens, ) +
-                             (1, ) * (softmax_stats.dim() - 2))
-    # masked_fill overwrites masked rows regardless of their current (possibly NaN)
-    # value and is CUDA-graph safe due to static shapes.
-    partial_o = partial_o.masked_fill(partial_o_mask, 0.0)
-    sm_max = softmax_stats[..., 0].masked_fill(softmax_mask, float("-inf"))
-    sm_sum = softmax_stats[..., 1].masked_fill(softmax_mask, 0.0)
-    softmax_stats = torch.stack([sm_max, sm_sum], dim=-1)
-    return partial_o, softmax_stats
-
-
-@torch.compile(options={"max-autotune": True})
-def _helix_compiled_post_process(
-    gathered_o: torch.Tensor,
-    gathered_softmax_stats: torch.Tensor,
-) -> torch.Tensor:
-    local_max = gathered_softmax_stats[..., 0]
-    local_sum = gathered_softmax_stats[..., 1]
-    global_max = local_max.max(dim=1, keepdim=True).values
-    correction = local_sum * torch.exp(local_max - global_max)
-    denominator = correction.sum(dim=1, keepdim=True)
-    correction = torch.where(denominator > 0, correction / denominator,
-                             torch.zeros_like(correction))
-    output = (gathered_o.float() * correction.unsqueeze(-1)).sum(dim=1)
-    return output.to(gathered_o.dtype)
-
-
 def _helix_post_process(
     partial_o: torch.Tensor,
     softmax_stats: torch.Tensor,
@@ -224,7 +152,6 @@ def _helix_post_process(
     value_dim: int,
     aux_stream: Optional[torch.cuda.Stream] = None,
     ln_events: Optional[list] = None,
-    zero_kv_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Helix CP post-processing: all-to-all exchange and combine partial
     attention outputs across CP ranks.
@@ -233,17 +160,11 @@ def _helix_post_process(
     dimension that differs between the two callers is *value_dim*
     (``head_dim`` for MHA, ``kv_lora_rank`` for MLA).
 
-    zero_kv_mask marks tokens for which this CP rank owns no KV blocks; those rows
-    are forced to a no-op contribution before the exchange (see
-    _helix_sanitize_empty_kv).
-
     When *aux_stream* and *ln_events* are provided the two
     ``.contiguous()`` calls in the FIFO-v1 path are overlapped on
     separate CUDA streams for better performance.
     """
-    partial_o, softmax_stats = _helix_sanitize_empty_kv(partial_o, softmax_stats,
-                                                        zero_kv_mask)
-    if mapping.cp_config.get("use_nccl_for_alltoall", False):
+    if mapping.cp_config.get("use_nccl_for_alltoall", True):
         # NCCL-based implementation using alltoall_helix.
         chunks = []
         for t in [partial_o, softmax_stats]:
@@ -779,17 +700,11 @@ class Attention(nn.Module):
             is_gen_only=False)
 
     def _helix_post_process(self, partial_o: torch.Tensor,
-                            softmax_stats: torch.Tensor,
-                            attn_metadata: AttentionMetadata) -> torch.Tensor:
+                            softmax_stats: torch.Tensor) -> torch.Tensor:
         """Helix CP post-processing: all-to-all exchange and combine partial
         attention outputs across CP ranks."""
-        zero_kv_mask = _helix_zero_kv_mask(attn_metadata, partial_o.shape[0])
-        return _helix_post_process(partial_o,
-                                   softmax_stats,
-                                   self.mapping,
-                                   self.num_heads_tp_cp,
-                                   self.head_dim,
-                                   zero_kv_mask=zero_kv_mask)
+        return _helix_post_process(partial_o, softmax_stats, self.mapping,
+                                   self.num_heads_tp_cp, self.head_dim)
 
     def _attn_impl(
         self,
@@ -850,8 +765,7 @@ class Attention(nn.Module):
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
-            attn_output = self._helix_post_process(attn_output, softmax_stats,
-                                                   attn_metadata)
+            attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
         # Don't set out_scale if o_proj has pre_quant_scale — this prevents
@@ -1890,119 +1804,10 @@ class MLA(nn.Module):
             q, self.num_heads_tp, self.qk_head_dim,
             float(self.q_b_layernorm.variance_epsilon))
 
-    def _supports_helix_full_v_projection(self) -> bool:
-        # The full dequantized V projection is not kept today; fall back to the
-        # latent exchange path for that FP8 variant.
-        if self.v_b_proj.dtype == torch.float8_e4m3fn:
-            return (self.v_b_proj_dequant is None
-                    and getattr(self.kv_b_proj, "weight_scale", None)
-                    is not None)
-        return self.v_b_proj.dtype == torch.bfloat16
-
-    def _full_v_b_proj_weight(self) -> torch.Tensor:
-        _, v_b_proj = self.kv_b_proj.weight.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim,
-            ],
-            dim=0,
-        )
-        return v_b_proj.view(self.num_heads_tp, self.v_head_dim,
-                             self.kv_lora_rank)
-
-    def _full_v_b_proj_scale(self) -> Optional[torch.Tensor]:
-        weight_scale = getattr(self.kv_b_proj, "weight_scale", None)
-        if weight_scale is None:
-            return None
-        qk_nope_head_dim = self.qk_nope_head_dim // 128
-        v_head_dim = self.v_head_dim // 128
-        kv_lora_rank = self.kv_lora_rank // 128
-        _, v_b_proj_scale = weight_scale.split(
-            [
-                self.num_heads_tp * qk_nope_head_dim,
-                self.num_heads_tp * v_head_dim,
-            ],
-            dim=0,
-        )
-        return v_b_proj_scale.view(self.num_heads_tp, v_head_dim,
-                                   kv_lora_rank)
-
-    def _project_helix_latent_to_v(self,
-                                   partial_o: torch.Tensor) -> torch.Tensor:
-        partial_o = partial_o.view(-1, self.num_heads_tp, self.kv_lora_rank)
-        v_b_proj = self._full_v_b_proj_weight()
-        projected = partial_o.new_empty(
-            partial_o.shape[0], self.num_heads_tp, self.v_head_dim)
-
-        if partial_o.is_cuda and v_b_proj.dtype == torch.bfloat16:
-            torch.ops.trtllm.bmm_out(partial_o.transpose(0, 1),
-                                     v_b_proj.transpose(1, 2),
-                                     projected.transpose(0, 1))
-        elif partial_o.is_cuda and v_b_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(
-                partial_o,
-                v_b_proj,
-                self._full_v_b_proj_scale(),
-                projected.transpose(0, 1),
-                None,
-                self.use_cute_dsl_blockscaling_bmm,
-            )
-        else:
-            projected = torch.bmm(partial_o.transpose(0, 1),
-                                  v_b_proj.transpose(1, 2)).transpose(0, 1)
-
-        return projected.reshape(partial_o.shape[0],
-                                 self.num_heads_tp * self.v_head_dim)
-
-    def _helix_stats_reduce_scatter(
-        self,
-        partial_o: torch.Tensor,
-        softmax_stats: torch.Tensor,
-        zero_kv_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        partial_o, softmax_stats = _helix_sanitize_empty_kv(
-            partial_o, softmax_stats, zero_kv_mask)
-        partial_v = self._project_helix_latent_to_v(partial_o)
-        partial_v = partial_v.view(-1, self.num_heads_tp, self.v_head_dim)
-
-        num_tokens = partial_o.shape[0]
-        cp_size = self.mapping.cp_size
-        helix = HelixAllToAllNative.get(self.mapping)
-        fifo_version = self.mapping.cp_config.get("fifo_version", 2)
-
-        if fifo_version == 1:
-            partial_v = partial_v.view(num_tokens, cp_size,
-                                       self.num_heads_tp_cp,
-                                       self.v_head_dim).transpose(
-                                           1, 2).contiguous()
-            softmax_stats = softmax_stats.view(
-                num_tokens, cp_size, self.num_heads_tp_cp, 2).transpose(
-                    1, 2).contiguous()
-            gathered_v, gathered_stats = helix.alltoall_native(
-                partial_v, softmax_stats)
-            gathered_v = gathered_v.transpose(1, 2).contiguous()
-            gathered_stats = gathered_stats.transpose(1, 2).contiguous()
-        else:
-            partial_v = partial_v.view(num_tokens, cp_size,
-                                       self.num_heads_tp_cp * self.v_head_dim)
-            softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                               self.num_heads_tp_cp * 2)
-            gathered_v, gathered_stats = helix.alltoall_native(
-                partial_v, softmax_stats)
-            gathered_v = gathered_v.view(num_tokens, cp_size,
-                                         self.num_heads_tp_cp, self.v_head_dim)
-            gathered_stats = gathered_stats.view(num_tokens, cp_size,
-                                                 self.num_heads_tp_cp, 2)
-
-        attn_out_v = _helix_compiled_post_process(gathered_v, gathered_stats)
-        return attn_out_v.reshape(partial_o.shape[0],
-                                  self.num_heads_tp_cp * self.v_head_dim)
-
     def _attn_forward_gen(self, attn_backend: AttentionBackend, q: torch.Tensor,
                           k: torch.Tensor, v: torch.Tensor,
                           position_ids: Optional[torch.Tensor],
                           attn_metadata: AttentionMetadata, **kwargs):
-        stats_reduce_scatter = kwargs.pop("stats_reduce_scatter", False)
         if self.mapping.has_cp_helix():
             # partial_o: [num_tokens, num_heads_tp * kv_lora_rank]
             # softmax_stats: [num_tokens, num_heads_tp, 2]
@@ -2020,19 +1825,9 @@ class MLA(nn.Module):
             kv_lora_rank = partial_o.shape[-1] // self.num_heads_tp
             assert self.kv_lora_rank == kv_lora_rank
 
-            zero_kv_mask = _helix_zero_kv_mask(attn_metadata, partial_o.shape[0])
-            if stats_reduce_scatter:
-                return self._helix_stats_reduce_scatter(
-                    partial_o, softmax_stats, zero_kv_mask)
-
-            return _helix_post_process(partial_o,
-                                       softmax_stats,
-                                       self.mapping,
-                                       self.num_heads_tp_cp,
-                                       kv_lora_rank,
-                                       self.aux_stream,
-                                       self.ln_events,
-                                       zero_kv_mask=zero_kv_mask)
+            return _helix_post_process(partial_o, softmax_stats, self.mapping,
+                                       self.num_heads_tp_cp, kv_lora_rank,
+                                       self.aux_stream, self.ln_events)
         else:
             attn_output = attn_backend.forward(
                 q,
@@ -3259,8 +3054,6 @@ class MLA(nn.Module):
 
         # Use generation_only for generation phase and context_only for context phase in DSA attention
         attention_input_type = AttentionInputType.generation_only
-        stats_reduce_scatter = (self.mapping.has_cp_helix()
-                                and self._supports_helix_full_v_projection())
 
         attn_out_latent = self._attn_forward_gen(
             self.mqa,
@@ -3282,16 +3075,8 @@ class MLA(nn.Module):
             mla_bmm1_scale=mla_bmm1_scale,  # used by `mlaGeneration`
             mla_bmm2_scale=mla_bmm2_scale,  # used by `mlaGeneration`
             quant_q_buffer=quant_q_buffer,  # used by `mlaGeneration`
-            stats_reduce_scatter=stats_reduce_scatter,
         )
         fused_q = None
-
-        if stats_reduce_scatter:
-            assert (attn_out_latent.shape[0] == q.shape[0]
-                    and attn_out_latent.shape[1]
-                    == self.num_heads_tp_cp * self.v_head_dim)
-            output.copy_(attn_out_latent.view_as(output))
-            return output
 
         if self.is_deepseek_v4:
             if self.mapping.has_cp_helix():

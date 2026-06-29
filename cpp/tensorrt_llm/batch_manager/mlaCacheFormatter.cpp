@@ -304,12 +304,6 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             auto cpDomainIdx = processIdx / connectionsPerCPDomain;
             auto ppDomainIdx = (processIdx % connectionsPerCPDomain) % pPDomainSize;
             auto cacheIdx = cpDomainIdx * pPDomainSize + ppDomainIdx;
-            // Helix CP empty ranks do not post a matching receive.
-            auto const& splitCache = outputSplitCaches.at(cacheIdx);
-            if (splitCache == nullptr || splitCache->getSizeInBytes() == 0)
-            {
-                return;
-            }
             if (cacheIdx < bufferCoverTargetNum)
             {
                 size_t size = outputSplitCaches.at(cacheIdx)->getSizeInBytes();
@@ -462,15 +456,6 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 outputBuffers.push_back(it);
                 blockNum++;
             }
-        }
-
-        // Helix CP empty rank: no KV blocks to receive.
-        if (blockNum == 0)
-        {
-            auto bufferKind = transferIndexerKCache ? BufferKind::kKV_INDEXER : BufferKind::kKV;
-            releasePreAssignedRecvBuffer(
-                connections[pickUpConnections[0]], mCacheTransBufferManagers[transferIndexerKCache], bufferKind);
-            continue;
         }
 
         int deviceId = bufferManager.getStream().getDevice();

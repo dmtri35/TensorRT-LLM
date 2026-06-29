@@ -98,13 +98,6 @@ template <typename T>
 std::list<std::vector<T>> chopVectorIntoBlocks(
     std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
 {
-    // Helix CP empty ranks can pass inputLength - 1 == -1.
-    if (usableSize < 0)
-    {
-        TLLM_CHECK_WITH_INFO(
-            usableSize == -1 && vec.empty(), "usableSize=%d is only valid for empty Helix CP ranks", usableSize);
-        return {};
-    }
     TLLM_CHECK_WITH_INFO(
         usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
     std::list<std::vector<T>> blockedVectors;

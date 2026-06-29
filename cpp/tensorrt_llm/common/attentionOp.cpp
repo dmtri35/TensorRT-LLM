@@ -1394,7 +1394,6 @@ int AttentionOp::mlaGeneration(
         fmhaParams.scaleBmm2Ptr = reinterpret_cast<float const*>(params.bmm2_scale);
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
-        fmhaParams.softmaxStatsPtr = generation_params.softmax_stats;
 
         // Sparse attention parameters
         if (useSparseMLA())
