@@ -2479,6 +2479,7 @@ class PyTorchModelEngine(ModelEngine):
             inactive_flags.append(not owned)
         return positions, inactive_flags
 
+
     def _prepare_encoder_decoder_cross_attention_inputs(
         self,
         encoder_hidden_states: List[torch.Tensor],

@@ -267,7 +267,7 @@ class ModelConfig(Generic[TConfig]):
                 head_dim = self.pretrained_config.kv_lora_rank + self.pretrained_config.qk_rope_head_dim
                 if head_dim == 576 and torch.cuda.get_device_capability() == (
                         9, 0):
-                    return False
+                    return True
         return False
 
     def get_quant_config(self, name: Optional[str] = None) -> QuantConfig:

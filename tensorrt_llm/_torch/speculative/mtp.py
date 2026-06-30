@@ -8,7 +8,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather
+from ..distributed.ops import allgather, cp_allgather
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -34,15 +34,15 @@ def _helix_draft_owner_batch_tensor(positions, total_input_len,
                                     cp_rank: int):
     decode_index = positions - total_input_len
     is_context_token = decode_index < 0
-    owner = is_context_token | (
+    return is_context_token | (
         ((decode_index // tokens_per_block) % cp_size) == cp_rank)
-    return owner
 
 
 @torch.compile(options={"max-autotune": True})
 def _helix_draft_owner_rows_tensor(positions, seq_lens, total_input_lens,
-                                   num_tokens: int, tokens_per_block: int,
-                                   cp_size: int, cp_rank: int):
+                                   batch_size: int, num_tokens: int,
+                                   tokens_per_block: int, cp_size: int,
+                                   cp_rank: int):
     total_input_len = torch.repeat_interleave(total_input_lens,
                                               seq_lens,
                                               output_size=num_tokens)
@@ -50,7 +50,86 @@ def _helix_draft_owner_rows_tensor(positions, seq_lens, total_input_lens,
     is_context_token = decode_index < 0
     owner = is_context_token | (
         ((decode_index // tokens_per_block) % cp_size) == cp_rank)
-    return ~owner
+    seq_ids = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.long, device=owner.device),
+        seq_lens,
+        output_size=num_tokens)
+    owner_counts = torch.zeros(batch_size,
+                               dtype=torch.int32,
+                               device=owner.device)
+    owner_counts.scatter_add_(0, seq_ids, owner.to(torch.int32))
+    return owner_counts, ~owner
+
+
+@torch.compile(options={"max-autotune": True})
+def _helix_accepted_owner_counts_tensor(seq_lens, inactive_rank,
+                                        num_accepted_tokens,
+                                        batch_size: int, num_tokens: int):
+    device = inactive_rank.device
+    seq_ids = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.long, device=device),
+        seq_lens,
+        output_size=num_tokens)
+    seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    token_idx = torch.arange(num_tokens, dtype=torch.long,
+                             device=device) - seq_starts[seq_ids]
+    accepted_lens = num_accepted_tokens[:batch_size].to(device=device,
+                                                        dtype=torch.long)
+    accepted = token_idx < accepted_lens[seq_ids]
+    owner = ~inactive_rank[:num_tokens]
+
+    accepted_owner_counts = torch.zeros(batch_size,
+                                        dtype=torch.int32,
+                                        device=device)
+    accepted_owner_counts.scatter_add_(0, seq_ids,
+                                       (owner & accepted).to(torch.int32))
+    return accepted_owner_counts
+
+
+@torch.compile(options={"max-autotune": True})
+def _helix_first_draft_kv_lens_delta_tensor(saved_inactive, saved_positions,
+                                            seq_lens, total_input_lens,
+                                            num_accepted_tokens,
+                                            batch_size: int, num_tokens: int,
+                                            tokens_per_block: int,
+                                            cp_size: int, cp_rank: int):
+    device = saved_inactive.device
+    seq_ids = torch.repeat_interleave(
+        torch.arange(batch_size, dtype=torch.long, device=device),
+        seq_lens,
+        output_size=num_tokens)
+    seq_starts = torch.cumsum(seq_lens, dim=0) - seq_lens
+    token_idx = torch.arange(num_tokens, dtype=torch.long,
+                             device=device) - seq_starts[seq_ids]
+
+    owner = ~saved_inactive[:num_tokens].to(device=device)
+    old_owned_counts = torch.zeros(batch_size,
+                                   dtype=torch.int32,
+                                   device=device)
+    old_owned_counts.scatter_add_(0, seq_ids, owner.to(torch.int32))
+
+    accepted_lens = num_accepted_tokens[:batch_size].to(device=device,
+                                                        dtype=torch.long)
+    desired_lens = accepted_lens + 1
+    saved_desired_lens = torch.minimum(desired_lens, seq_lens)
+    desired_owner = owner & (token_idx < saved_desired_lens[seq_ids])
+    desired_owned_counts = torch.zeros_like(old_owned_counts)
+    desired_owned_counts.scatter_add_(0, seq_ids,
+                                      desired_owner.to(torch.int32))
+
+    positions = saved_positions[:num_tokens].to(device=device,
+                                                dtype=torch.int64)
+    total_input_len = total_input_lens[:batch_size].to(device=device,
+                                                       dtype=torch.int64)
+    decode_index = positions - total_input_len[seq_ids]
+    seq_start_indices = torch.clamp(seq_starts, 0, num_tokens - 1)
+    next_decode_index = decode_index[seq_start_indices] + accepted_lens
+    next_owner = ((next_decode_index // tokens_per_block) %
+                  cp_size) == cp_rank
+    extra_owner = (desired_lens > seq_lens) & next_owner
+    desired_owned_counts += extra_owner.to(torch.int32)
+
+    return desired_owned_counts - old_owned_counts
 
 
 @torch.compile(options={"max-autotune": True})
@@ -67,6 +146,16 @@ def _helix_rejected_owned_tensor(inactive_rank, num_accepted_tokens,
     rejected = token_indices >= num_accepted_tokens[
         num_contexts:batch_size].unsqueeze(1)
     return ((~gen_flags) & rejected).sum(dim=1)
+
+
+@torch.compile(options={"max-autotune": True})
+def _helix_sync_draft_token_from_gathered(gathered_tokens, owner_rank,
+                                          num_gens: int):
+    gen_indices = torch.arange(num_gens,
+                               dtype=torch.long,
+                               device=gathered_tokens.device)
+    gathered_indices = owner_rank.to(torch.long) * num_gens + gen_indices
+    return gathered_tokens[gathered_indices]
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -376,7 +465,6 @@ class MTPWorker(SpecWorkerBase):
             return None
 
         positions = position_ids.to(torch.int64).reshape(-1)
-
         if positions.numel() == batch_size:
             total_input_len = attn_metadata.helix_total_input_len[:
                                                                   batch_size].to(
@@ -387,7 +475,7 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.helix_position_offsets[:batch_size].copy_(
                 positions.to(torch.int32))
             attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
-            return
+            return owner
 
         positions = positions[:attn_metadata.num_tokens]
         num_tokens = positions.shape[0]
@@ -397,10 +485,11 @@ class MTPWorker(SpecWorkerBase):
             # generation requests while attn_metadata still tracks target rows.
             seq_lens = seq_lens.clone()
             seq_lens[attn_metadata.num_contexts:batch_size] -= 1
-        inactive_rank = _helix_draft_owner_rows_tensor(
+        owner_counts, inactive_rank = _helix_draft_owner_rows_tensor(
             positions,
             seq_lens,
             attn_metadata.helix_total_input_len[:batch_size].to(torch.int64),
+            batch_size,
             num_tokens,
             attn_metadata.tokens_per_block,
             mapping.cp_size,
@@ -409,7 +498,98 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata.helix_position_offsets[:num_tokens].copy_(
             positions.to(torch.int32))
         attn_metadata.helix_is_inactive_rank[:num_tokens].copy_(inactive_rank)
-        return
+        return owner_counts
+
+    def _helix_accepted_owner_counts(self, attn_metadata, num_accepted_tokens,
+                                     batch_size):
+        if getattr(attn_metadata, 'helix_is_inactive_rank', None) is None:
+            return None
+
+        num_tokens = attn_metadata.num_tokens
+        device = attn_metadata.helix_is_inactive_rank.device
+        seq_lens = attn_metadata.seq_lens_cuda[:batch_size].to(device=device,
+                                                               dtype=torch.long)
+        return _helix_accepted_owner_counts_tensor(
+            seq_lens, attn_metadata.helix_is_inactive_rank,
+            num_accepted_tokens, batch_size, num_tokens)
+
+    def _helix_first_draft_kv_lens_delta(self, attn_metadata,
+                                         num_accepted_tokens, owner_counts,
+                                         batch_size):
+        saved_inactive = getattr(self, '_saved_helix_is_inactive_rank', None)
+        saved_positions = getattr(self, '_saved_helix_position_offsets', None)
+        if saved_inactive is not None and saved_positions is not None:
+            device = saved_inactive.device
+            num_tokens = attn_metadata.num_tokens
+            num_contexts = attn_metadata.num_contexts
+            seq_lens = attn_metadata.seq_lens_cuda[:batch_size].to(
+                device=device, dtype=torch.long)
+            kv_lens_delta = _helix_first_draft_kv_lens_delta_tensor(
+                saved_inactive, saved_positions, seq_lens,
+                attn_metadata.helix_total_input_len, num_accepted_tokens,
+                batch_size, num_tokens, attn_metadata.tokens_per_block,
+                self.model_config.mapping.cp_size,
+                self.model_config.mapping.cp_rank)
+            if num_contexts > 0:
+                accepted_owner_counts = self._helix_accepted_owner_counts(
+                    attn_metadata, num_accepted_tokens, batch_size)
+                if accepted_owner_counts is not None:
+                    kv_lens_delta[:num_contexts] = (
+                        accepted_owner_counts[:num_contexts])
+            return kv_lens_delta
+
+        accepted_owner_counts = self._helix_accepted_owner_counts(
+            attn_metadata, num_accepted_tokens, batch_size)
+        if accepted_owner_counts is None:
+            return None
+
+        owner_counts = owner_counts.to(device=accepted_owner_counts.device,
+                                       dtype=accepted_owner_counts.dtype)
+        kv_lens_delta = accepted_owner_counts - owner_counts
+        num_contexts = attn_metadata.num_contexts
+        if num_contexts > 0:
+            kv_lens_delta[:num_contexts] = (
+                accepted_owner_counts[:num_contexts])
+        return kv_lens_delta
+
+    def _helix_sync_new_draft_token(self, new_draft_token, target_position_ids,
+                                    num_accepted_tokens, attn_metadata,
+                                    draft_step: int):
+        mapping = getattr(self.model_config, "mapping", None)
+        if mapping is None or not mapping.has_cp_helix():
+            return new_draft_token
+
+        num_contexts = attn_metadata.num_contexts
+        batch_size = attn_metadata.num_seqs
+        num_gens = batch_size - num_contexts
+        if num_gens <= 0:
+            return new_draft_token
+
+        mtp_num_modules = self.spec_config.max_draft_len
+        positions = target_position_ids.reshape(-1)
+        gen_positions = positions[attn_metadata.num_ctx_tokens:].reshape(
+            num_gens, mtp_num_modules + 1)
+        first_gen_positions = gen_positions[:, 0].to(torch.int64)
+        accepted_lens = num_accepted_tokens[num_contexts:batch_size].to(
+            device=first_gen_positions.device, dtype=torch.int64)
+        draft_positions = first_gen_positions + accepted_lens + draft_step + 1
+
+        total_input_len = attn_metadata.helix_total_input_len[
+            num_contexts:batch_size].to(device=draft_positions.device,
+                                        dtype=torch.int64)
+        decode_index = draft_positions - total_input_len
+        owner_rank = torch.div(torch.clamp(decode_index, min=0),
+                               attn_metadata.tokens_per_block,
+                               rounding_mode='floor') % mapping.cp_size
+
+        local_gen_tokens = new_draft_token[num_contexts:batch_size].contiguous()
+        gathered_tokens = cp_allgather(local_gen_tokens, mapping, dim=0)
+        synced_tokens = _helix_sync_draft_token_from_gathered(
+            gathered_tokens, owner_rank, num_gens)
+        synced_draft_token = new_draft_token.clone()
+        synced_draft_token[num_contexts:batch_size].copy_(
+            synced_tokens.to(dtype=synced_draft_token.dtype))
+        return synced_draft_token
 
     def forward(
         self,
@@ -592,6 +772,9 @@ class MTPWorker(SpecWorkerBase):
 
                     new_draft_token = self.draft_sampler(
                         logits, draft_model.lm_head.mapping)
+                    new_draft_token = self._helix_sync_new_draft_token(
+                        new_draft_token, position_ids, num_accepted_tokens,
+                        attn_metadata, i)
                     next_draft_tokens.append(new_draft_token)
                     # shift input_ids and hidden_states
                     input_ids = draft_inputs["input_ids"]

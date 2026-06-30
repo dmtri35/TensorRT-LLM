@@ -45,23 +45,6 @@ using tensorrt_llm::common::op::AttentionWorkspaceManager;
 using tensorrt_llm::common::op::AttentionXqaWorkspaceSizes;
 using tensorrt_llm::common::op::KvCacheBuffers;
 
-namespace
-{
-
-size_t getTllmGenMlaScratchWorkspaceSize(
-    size_t const elemSize, int32_t const headDim, int32_t const multiProcessorCount)
-{
-    static constexpr int32_t kScratchRowsPerCta = 256;
-    int const kNumBuffers = 3;
-    size_t workspaces[kNumBuffers];
-    workspaces[0] = elemSize * kScratchRowsPerCta * multiProcessorCount * headDim;
-    workspaces[1] = sizeof(float) * kScratchRowsPerCta * multiProcessorCount;
-    workspaces[2] = sizeof(float) * kScratchRowsPerCta * multiProcessorCount;
-    return tc::calculateTotalWorkspaceSize(workspaces, kNumBuffers);
-}
-
-} // namespace
-
 template <typename T>
 struct SATypeConverter
 {
@@ -959,9 +942,7 @@ size_t AttentionOp::getWorkspaceSizeForGeneration(nvinfer1::DataType type, int32
 
         size_t const cu_seqlens_size = sizeof(int) * (max_num_seq + 1);
         size_t const fmha_scheduler_counter = sizeof(uint32_t);
-        int32_t const headDim = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
-        size_t const fmha_multi_ctas_kv_scratch_size
-            = getTllmGenMlaScratchWorkspaceSize(size, headDim, mMultiProcessorCount);
+        size_t const fmha_multi_ctas_kv_scratch_size = getFmhaMultiCtasKvScratchSize();
 
         int const NUM_BUFFERS = 5;
         size_t workspaces[NUM_BUFFERS];
@@ -1072,8 +1053,7 @@ int AttentionOp::mlaGeneration(
     // Currently NVFP4 KV cache is not supported for MLA. An empty placeholder is provided.
     auto kv_scale_cache_buffer = KVBlockArray();
 
-    int8_t* workspace_byte_ptr = reinterpret_cast<int8_t*>(params.workspace);
-    size_t offset = 0;
+    void* scratchPtr = params.workspace;
 
     params.quant_scale_o = generation_params.attention_output_orig_quant;
     params.quant_scale_q = generation_params.kv_scale_orig_quant;
@@ -1099,8 +1079,6 @@ int AttentionOp::mlaGeneration(
     if (mUseTllmGen)
     {
         TLLM_CHECK_WITH_INFO(mTllmGenFMHARunner.get(), "mTllmGenFMHARunner not initialized.");
-        void* scratchPtr = nextWorkspacePtr(
-            workspace_byte_ptr, offset, getTllmGenMlaScratchWorkspaceSize(sizeof(T), head_size, mMultiProcessorCount));
         TllmGenFmhaRunnerParams tllmRunnerParams{};
 
         // Parameters to select kernels.
@@ -1108,12 +1086,10 @@ int AttentionOp::mlaGeneration(
         // shrinking each token's effective KV length.
         tllmRunnerParams.mMaskType = TrtllmGenAttentionMaskType::Dense;
         tllmRunnerParams.mKernelType = FmhaKernelType::Generation;
-        bool const useMultiCtasKvMode = mMultiBlockMode || generation_params.softmax_stats != nullptr;
-        tllmRunnerParams.mMultiCtasKvMode = useMultiCtasKvMode;
-        // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode
-        // or when Helix needs the reduction path to return softmax stats.
+        tllmRunnerParams.mMultiCtasKvMode = mMultiBlockMode;
+        // Note that the tileScheduler and multiCtasKvMode will be automatically tuned when using multi_block mode.
         // Otherwise, always enable the persistent scheduler for better performance.
-        tllmRunnerParams.mTileScheduler = useMultiCtasKvMode ? TileScheduler::Static : TileScheduler::Persistent;
+        tllmRunnerParams.mTileScheduler = mMultiBlockMode ? TileScheduler::Static : TileScheduler::Persistent;
 
         // Q buffer.
         tllmRunnerParams.qPtr = mFP8GenerationMLA ? reinterpret_cast<void const*>(params.quant_q_buf)

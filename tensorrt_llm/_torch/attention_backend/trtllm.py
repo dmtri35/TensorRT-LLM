@@ -71,6 +71,7 @@ def generate_spec_decoding_packed_mask(max_num_requests: int,
     return mask
 
 
+
 @dataclass(kw_only=True)
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
@@ -485,6 +486,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return torch.bincount(seq_ids[active_tokens],
                               minlength=self.num_seqs).to(torch.int)
 
+
     def update_helix_param(
         self,
         helix_position_offsets: List[int],
@@ -566,13 +568,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             kv_lens = cached_token_lens.clone()
             total_q_len = int(self.seq_lens_kv[:self.num_seqs].sum().item())
-            use_owned_token_counts = (self.helix_is_inactive_rank_cpu
-                                      is not None
+            use_owned_token_counts = (self.helix_is_inactive_rank_cpu is not None
                                       and self.helix_is_inactive_rank_cpu.numel()
                                       >= total_q_len)
             if use_owned_token_counts:
-                owned_counts = self._helix_owned_token_counts()
-                kv_lens += owned_counts
+                kv_lens += self._helix_owned_token_counts()
             else:
                 active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
                 kv_lens[active_rank] += self.seq_lens_kv[active_rank]

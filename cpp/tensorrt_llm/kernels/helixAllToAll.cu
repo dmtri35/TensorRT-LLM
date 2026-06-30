@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -239,31 +239,14 @@ __device__ __forceinline__ HelixFifoInfo* getReceiverHelixFifoInfo(
 __device__ __forceinline__ void startWorkspaceS2GReg(
     uint64_t* fifoEntry, uint8_t* sharedMemoryBase, int send128ByteCount, int fifo128ByteOffset, int laneId)
 {
-    int copyU64Count = send128ByteCount * UINT64_PER_128B_BLOCK;
-    auto* sharedMemoryU64 = reinterpret_cast<uint64_t*>(sharedMemoryBase);
+    int copyInt4Count = send128ByteCount * BYTES_PER_128B_BLOCK / sizeof(int4);
+    int4* sharedMemoryInt4 = reinterpret_cast<int4*>(sharedMemoryBase);
     uint64_t* fifoPtr = fifoEntry + fifo128ByteOffset * UINT64_PER_128B_BLOCK;
-
-    // LL128 uses one uint64 flag inside every 128-byte block.  Publish payload
-    // and tail data before publishing those flags; otherwise a receiver can
-    // observe the flag and unpack stale bytes from the same FIFO entry.
-    for (int i = laneId; i < copyU64Count; i += WARP_SIZE)
+    int4* fifoPtrInt4 = reinterpret_cast<int4*>(fifoPtr);
+#pragma unroll 4
+    for (int i = laneId; i < copyInt4Count; i += WARP_SIZE)
     {
-        int blockIdx128B = i / UINT64_PER_128B_BLOCK;
-        int innerIdx = i % UINT64_PER_128B_BLOCK;
-        int flagInnerIdx = (fifo128ByteOffset + blockIdx128B) % UINT64_PER_128B_BLOCK;
-        if (innerIdx != flagInnerIdx)
-        {
-            fifoPtr[i] = sharedMemoryU64[i];
-        }
-    }
-    __syncwarp();
-    __threadfence_system();
-
-    for (int blockIdx128B = laneId; blockIdx128B < send128ByteCount; blockIdx128B += WARP_SIZE)
-    {
-        int flagInnerIdx = (fifo128ByteOffset + blockIdx128B) % UINT64_PER_128B_BLOCK;
-        int flagIdx = blockIdx128B * UINT64_PER_128B_BLOCK + flagInnerIdx;
-        fifoPtr[flagIdx] = sharedMemoryU64[flagIdx];
+        fifoPtrInt4[i] = sharedMemoryInt4[i];
     }
 }
 
@@ -369,8 +352,8 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
     if (isSender)
     {
-        // Sender CTAs do not produce the local receive buffers consumed by the
-        // postprocess kernel, so they can release dependent work early.
+        // sender blocks should trigger next kernel immediately, s.t. they
+        // do not block the next kernel from starting
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
         cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -444,6 +427,15 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
         // Start at channel index, increment by total channel count
         for (int entryIdx = pairInfo.channel; entryIdx < params.entryCount; entryIdx += runChannelCount)
         {
+            // receiver blocks should trigger next kernel at last iteration
+            // note: some blocks might not even go into this for-loop, but they
+            // would exit which is equivalent to the pre-exit trigger
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+            if (entryIdx + runChannelCount >= params.entryCount)
+            {
+                cudaTriggerProgrammaticLaunchCompletion();
+            }
+#endif
             // dataIndex points to where we receive data from peerRank in this entry
             int dataIndex = entryIdx * params.cpSize + peerRank;
             int loaded128ByteCount = 0;
@@ -483,13 +475,8 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
 
             // note: fields are already unpacked in shared memory
             s2gAllFields<ALLOW_VARIABLE_FIELD1>(params.recvFields, dataIndex, shmem, laneId);
-            // Wait for the shared-to-global writes to complete before the
-            // shared memory can be reused or dependent kernels can consume the
-            // receive buffers.
-            cp_async_bulk_wait_group<0>();
-            // Receiver blocks intentionally release dependent kernels by
-            // exiting instead of by an explicit PDL trigger; postprocess
-            // consumes the receive buffers produced here.
+            // wait for data to be read from shared memory
+            cp_async_bulk_wait_group_read<0>();
 
             // note: LL128Proto doesn't need rearm
             // rearmFifoBuffer();
@@ -501,12 +488,6 @@ __global__ void helixAllToAllKernel(HelixAllToAllParams params)
             receiverFifo->tail = tail;
             senderFifo->tail = tail;
         }
-
-        // Receiver CTAs release dependent work only after the receive buffers
-        // consumed by postprocess have been fully written.
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-        cudaTriggerProgrammaticLaunchCompletion();
-#endif
     }
 }
 
