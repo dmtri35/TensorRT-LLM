@@ -2906,8 +2906,7 @@ class PyTorchModelEngine(ModelEngine):
             self.num_accepted_draft_tokens_cuda[idx_accepted_tokens] + 1)
 
         self.num_accepted_draft_tokens_cuda[:num_extend_reqeust_wo_dummy].copy_(
-            num_accepted_tokens_device[
-                previous_slots[:num_extend_reqeust_wo_dummy]],
+            num_accepted_tokens_device[:num_extend_reqeust_wo_dummy],
             non_blocking=True)
 
         # Initialize offset tensors to zeros
@@ -3463,12 +3462,6 @@ class PyTorchModelEngine(ModelEngine):
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.extend(inactive_h)
                     helix_total_input_len.append(request.total_input_len_cp)
-                elif not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[0])
                 else:
                     position_ids.extend(
                         list(
@@ -3501,11 +3494,6 @@ class PyTorchModelEngine(ModelEngine):
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.extend(inactive_h)
                     helix_total_input_len.append(request.total_input_len_cp)
-                elif not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[0])
                 else:
                     position_ids.extend(
                         list(

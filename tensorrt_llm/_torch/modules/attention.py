@@ -701,8 +701,7 @@ class Attention(nn.Module):
             is_gen_only=False)
 
     def _helix_post_process(self, partial_o: torch.Tensor,
-                            softmax_stats: torch.Tensor,
-                            attn_metadata: AttentionMetadata) -> torch.Tensor:
+                            softmax_stats: torch.Tensor) -> torch.Tensor:
         """Helix CP post-processing: all-to-all exchange and combine partial
         attention outputs across CP ranks."""
         return _helix_post_process(partial_o, softmax_stats, self.mapping,
@@ -767,8 +766,7 @@ class Attention(nn.Module):
                 ))
             if isinstance(attn_output, tuple):
                 attn_output = attn_output[0]
-            attn_output = self._helix_post_process(attn_output, softmax_stats,
-                                                   attn_metadata)
+            attn_output = self._helix_post_process(attn_output, softmax_stats)
             return attn_output, None
 
         # Don't set out_scale if o_proj has pre_quant_scale — this prevents

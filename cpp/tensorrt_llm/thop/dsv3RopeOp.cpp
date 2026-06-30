@@ -71,7 +71,7 @@ struct MlaRopeGenArgs
     float host_bmm1_scale;
     int32_t const* helix_position_offsets_ptr;
     bool const* helix_is_inactive_rank_ptr;
-    bool helix_is_inactive_rank_per_token;
+    bool helix_is_inactive_rank_per_token{false};
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -233,8 +233,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         static_cast<int32_t>(num_heads), mla_meta_params, sequence_lengths_ptr, max_context_q_len,
         block_ids_per_seq_ptr, cache_type, cu_q_seqlens_ptr, cu_kv_seqlens_ptr, fmha_tile_counter_ptr,
         mla_bmm1_scale_ptr, mla_bmm2_scale_ptr, quant_q_buffer_ptr, quant_scale_o_ptr, kv_scale_orig_quant_ptr,
-        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr,
-        helix_is_inactive_rank_per_token};
+        kv_scale_quant_orig_ptr, host_bmm1_scale, helix_position_offsets_ptr, helix_is_inactive_rank_ptr};
+    args.helix_is_inactive_rank_per_token = helix_is_inactive_rank_per_token;
 
     auto const input_dtype = fused_q.scalar_type();
     if (input_dtype == torch::kFloat16)
