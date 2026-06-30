@@ -10,7 +10,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather, cp_allgather
+from ..distributed.ops import allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
@@ -18,13 +18,7 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
-from .mtp import (MTPSampler, _helix_accepted_owner_counts_tensor,
-                  _helix_draft_owner_batch_tensor,
-                  _helix_draft_owner_rows_tensor,
-                  _helix_first_draft_kv_lens_delta_tensor,
-                  _helix_rejected_owned_tensor,
-                  _helix_sync_draft_token_from_gathered,
-                  _select_mtp_position_ids)
+from .mtp import MTPSampler, _select_mtp_position_ids
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -605,22 +599,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
         batch_size = attn_metadata.num_seqs
 
-        if self.is_mtp_eagle and hasattr(attn_metadata, 'kv_lens_cuda'):
-            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
-                                                                  batch_size].clone(
-                                                                  )
-        else:
-            self._saved_kv_lens_cuda = None
-        self._saved_helix_position_offsets = None
-        self._saved_helix_is_inactive_rank = None
-        if self.is_mtp_eagle:
-            if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
-                self._saved_helix_position_offsets = attn_metadata.helix_position_offsets.clone(
-                )
-            if getattr(attn_metadata, 'helix_is_inactive_rank', None) is not None:
-                self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank.clone(
-                )
-
         # Save spec-dec params that the drafting loop will overwrite.
         # Without this, CUDA graph warmup's second iteration would run
         # the target model attention with stale draft-layer masks
@@ -647,19 +625,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-        if self._saved_kv_lens_cuda is not None:
-            batch_size = self._saved_kv_lens_cuda.shape[0]
-            attn_metadata.kv_lens_cuda[:batch_size].copy_(
-                self._saved_kv_lens_cuda)
-            self._saved_kv_lens_cuda = None
-        if self._saved_helix_position_offsets is not None:
-            attn_metadata.helix_position_offsets.copy_(
-                self._saved_helix_position_offsets)
-            self._saved_helix_position_offsets = None
-        if self._saved_helix_is_inactive_rank is not None:
-            attn_metadata.helix_is_inactive_rank.copy_(
-                self._saved_helix_is_inactive_rank)
-            self._saved_helix_is_inactive_rank = None
         if self._saved_packed_mask is not None:
             batch_size = self._saved_packed_mask.shape[0]
             attn_metadata.spec_decoding_packed_mask[:batch_size].copy_(
@@ -677,142 +642,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             attn_metadata.spec_decoding_generation_lengths[:batch_size].copy_(
                 self._saved_generation_lengths)
             self._saved_generation_lengths = None
-
-    def _helix_draft_owner_mask(self, attn_metadata, position_ids, batch_size):
-        mapping = None
-        if self.model_config is not None:
-            mapping = getattr(self.model_config, "mapping", None)
-        if mapping is None or not mapping.has_cp_helix():
-            return None
-
-        positions = position_ids.to(torch.int64).reshape(-1)
-        if positions.numel() == batch_size:
-            total_input_len = attn_metadata.helix_total_input_len[:
-                                                                  batch_size].to(
-                                                                  torch.int64)
-            owner = _helix_draft_owner_batch_tensor(
-                positions, total_input_len, attn_metadata.tokens_per_block,
-                mapping.cp_size, mapping.cp_rank)
-            attn_metadata.helix_position_offsets[:batch_size].copy_(
-                positions.to(torch.int32))
-            attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
-            return owner
-
-        positions = positions[:attn_metadata.num_tokens]
-        num_tokens = positions.shape[0]
-        seq_lens = attn_metadata.seq_lens_cuda[:batch_size].to(torch.long)
-        if num_tokens != attn_metadata.num_tokens:
-            seq_lens = seq_lens.clone()
-            seq_lens[attn_metadata.num_contexts:batch_size] -= 1
-        owner_counts, inactive_rank = _helix_draft_owner_rows_tensor(
-            positions,
-            seq_lens,
-            attn_metadata.helix_total_input_len[:batch_size].to(torch.int64),
-            batch_size,
-            num_tokens,
-            attn_metadata.tokens_per_block,
-            mapping.cp_size,
-            mapping.cp_rank,
-        )
-        attn_metadata.helix_position_offsets[:num_tokens].copy_(
-            positions.to(torch.int32))
-        attn_metadata.helix_is_inactive_rank[:num_tokens].copy_(inactive_rank)
-        return owner_counts
-
-    def _helix_accepted_owner_counts(self, attn_metadata, num_accepted_tokens,
-                                     batch_size):
-        if getattr(attn_metadata, 'helix_is_inactive_rank', None) is None:
-            return None
-
-        num_tokens = attn_metadata.num_tokens
-        device = attn_metadata.helix_is_inactive_rank.device
-        seq_lens = attn_metadata.seq_lens_cuda[:batch_size].to(device=device,
-                                                               dtype=torch.long)
-        return _helix_accepted_owner_counts_tensor(
-            seq_lens, attn_metadata.helix_is_inactive_rank,
-            num_accepted_tokens, batch_size, num_tokens)
-
-    def _helix_first_draft_kv_lens_delta(self, attn_metadata,
-                                         num_accepted_tokens, owner_counts,
-                                         batch_size):
-        saved_inactive = getattr(self, '_saved_helix_is_inactive_rank', None)
-        saved_positions = getattr(self, '_saved_helix_position_offsets', None)
-        if saved_inactive is not None and saved_positions is not None:
-            device = saved_inactive.device
-            num_tokens = attn_metadata.num_tokens
-            num_contexts = attn_metadata.num_contexts
-            seq_lens = attn_metadata.seq_lens_cuda[:batch_size].to(
-                device=device, dtype=torch.long)
-            kv_lens_delta = _helix_first_draft_kv_lens_delta_tensor(
-                saved_inactive, saved_positions, seq_lens,
-                attn_metadata.helix_total_input_len, num_accepted_tokens,
-                batch_size, num_tokens, attn_metadata.tokens_per_block,
-                self.model_config.mapping.cp_size,
-                self.model_config.mapping.cp_rank)
-            if num_contexts > 0:
-                accepted_owner_counts = self._helix_accepted_owner_counts(
-                    attn_metadata, num_accepted_tokens, batch_size)
-                if accepted_owner_counts is not None:
-                    kv_lens_delta[:num_contexts] = (
-                        accepted_owner_counts[:num_contexts])
-            return kv_lens_delta
-
-        accepted_owner_counts = self._helix_accepted_owner_counts(
-            attn_metadata, num_accepted_tokens, batch_size)
-        if accepted_owner_counts is None:
-            return None
-
-        owner_counts = owner_counts.to(device=accepted_owner_counts.device,
-                                       dtype=accepted_owner_counts.dtype)
-        kv_lens_delta = accepted_owner_counts - owner_counts
-        num_contexts = attn_metadata.num_contexts
-        if num_contexts > 0:
-            kv_lens_delta[:num_contexts] = (
-                accepted_owner_counts[:num_contexts])
-        return kv_lens_delta
-
-    def _helix_draft_owner_rank(self, position_ids, attn_metadata,
-                                num_contexts: int, batch_size: int):
-        mapping = getattr(self.model_config, "mapping", None)
-        if mapping is None or not mapping.has_cp_helix():
-            return None
-
-        num_gens = batch_size - num_contexts
-        if num_gens <= 0:
-            return None
-
-        positions = position_ids.reshape(-1)
-        if positions.numel() != batch_size:
-            return None
-
-        gen_positions = positions[num_contexts:batch_size].to(torch.int64)
-        total_input_len = attn_metadata.helix_total_input_len[
-            num_contexts:batch_size].to(device=gen_positions.device,
-                                        dtype=torch.int64)
-        decode_index = gen_positions - total_input_len
-        return torch.div(torch.clamp(decode_index, min=0),
-                         attn_metadata.tokens_per_block,
-                         rounding_mode='floor') % mapping.cp_size
-
-    def _helix_sync_new_draft_token(self, new_draft_token, draft_position_ids,
-                                    attn_metadata, num_contexts: int,
-                                    batch_size: int, draft_step: int):
-        mapping = getattr(self.model_config, "mapping", None)
-        owner_rank = self._helix_draft_owner_rank(draft_position_ids,
-                                                 attn_metadata, num_contexts,
-                                                 batch_size)
-        if owner_rank is None:
-            return new_draft_token
-
-        num_gens = batch_size - num_contexts
-        local_gen_tokens = new_draft_token[num_contexts:batch_size].contiguous()
-        gathered_tokens = cp_allgather(local_gen_tokens, mapping, dim=0)
-        synced_tokens = _helix_sync_draft_token_from_gathered(
-            gathered_tokens, owner_rank, num_gens)
-        synced_draft_token = new_draft_token.clone()
-        synced_draft_token[num_contexts:batch_size].copy_(
-            synced_tokens.to(dtype=synced_draft_token.dtype))
-        return synced_draft_token
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
@@ -949,11 +778,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
-                helix_owner_mask = None
-                if self.is_mtp_eagle:
-                    helix_owner_mask = self._helix_draft_owner_mask(
-                        attn_metadata, inputs["position_ids"], batch_size)
-
                 # Run draft model (mode-specific via helper). The helper
                 # passes ``all_rank_num_tokens`` as a kwarg so the draft model
                 # handles save/restore internally (Eagle3DraftModel.forward
@@ -1054,6 +878,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                      spec_metadata,
                                                      batch_size,
                                                      draft_step=i)
+                next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
                 # MTP Eagle: the MTP layer returns a single tensor; slice by
@@ -1064,30 +889,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     hidden_states = hidden_states[gather_ids]
                 else:
                     hidden_states = hidden_states_to_save[gather_ids]
-                selected_position_ids = _select_mtp_position_ids(
-                    inputs["position_ids"], gather_ids)
-                position_ids = selected_position_ids + 1
-                new_draft_token = self._helix_sync_new_draft_token(
-                    new_draft_token, position_ids, attn_metadata, num_contexts,
-                    batch_size, i)
-                next_draft_tokens.append(new_draft_token)
+                position_ids = (_select_mtp_position_ids(
+                    inputs["position_ids"], gather_ids) + 1)
 
                 # Update attn_metadata for the next iteration.
                 if i == 0:
-                    helix_kv_lens_delta = None
-                    helix_rejected_owned = None
-                    if helix_owner_mask is not None:
-                        helix_kv_lens_delta = (
-                            self._helix_first_draft_kv_lens_delta(
-                                attn_metadata, num_accepted_tokens,
-                                helix_owner_mask, batch_size))
-                        num_gens = batch_size - num_contexts
-                        if num_gens > 0:
-                            helix_rejected_owned = _helix_rejected_owned_tensor(
-                                attn_metadata.helix_is_inactive_rank,
-                                num_accepted_tokens, num_contexts, batch_size,
-                                attn_metadata.num_ctx_tokens,
-                                runtime_draft_len)
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
@@ -1098,32 +904,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                                                          num_contexts].fill_(1)
                         attn_metadata.num_contexts = 0
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        if helix_kv_lens_delta is not None:
-                            attn_metadata.kv_lens_cuda[:batch_size] += (
-                                helix_kv_lens_delta.to(
-                                    attn_metadata.kv_lens_cuda.dtype))
-                        else:
-                            attn_metadata.kv_lens_cuda[
-                                num_contexts:batch_size] -= (
-                                    runtime_draft_len -
-                                    num_accepted_tokens[num_contexts:])
-                            attn_metadata.kv_lens_cuda[:num_contexts] += 1
-                    if (self.is_mtp_eagle
-                            and attn_metadata.kv_cache_params is not None
-                            and not attn_metadata.is_cuda_graph):
-                        helix_rejected_owned_cpu = (
-                            helix_rejected_owned.cpu().tolist()
-                            if helix_rejected_owned is not None else None)
-                        for seq_idx in range(num_contexts, batch_size):
-                            if helix_rejected_owned_cpu is not None:
-                                rewind_count = helix_rejected_owned_cpu[
-                                    seq_idx - num_contexts]
-                            else:
-                                rewind_count = (runtime_draft_len + 1 -
-                                                num_accepted_tokens[seq_idx].
-                                                item())
-                            attn_metadata.kv_cache_params.num_cached_tokens_per_seq[
-                                seq_idx] -= rewind_count
+                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
+                            runtime_draft_len -
+                            num_accepted_tokens[num_contexts:])
+                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
+
                     if has_kv_cache:
                         self._prepare_flash_mla_generation_layout(
                             attn_metadata, num_contexts, batch_size)
@@ -1138,12 +923,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     attn_metadata.use_spec_decoding = False
                 else:
                     if hasattr(attn_metadata, 'kv_lens_cuda'):
-                        if helix_owner_mask is not None:
-                            attn_metadata.kv_lens_cuda[:batch_size] += (
-                                helix_owner_mask.to(
-                                    attn_metadata.kv_lens_cuda.dtype))
-                        else:
-                            attn_metadata.kv_lens_cuda[:batch_size] += 1
+                        attn_metadata.kv_lens_cuda[:batch_size] += 1
                         attn_metadata.update_for_spec_dec()
 
                 inputs = {
@@ -1263,27 +1043,25 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         Falls back to simple argmax when no tensor parallelism is active or
         when only attention DP is enabled without LM-head TP.
         """
-        sampler_mapping = mapping_lm_head_tp
-        if (sampler_mapping is None and self.model_config is not None
-                and hasattr(self.model_config, 'mapping')):
-            sampler_mapping = self.model_config.mapping
-
-        if (sampler_mapping is not None and sampler_mapping.tp_size > 1
-                and not sampler_mapping.enable_attention_dp):
-            combined = self._get_local_max_and_combined(logits,
-                                                        sampler_mapping)
-            gathered = allgather(combined, sampler_mapping, dim=-1)
+        if (self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size > 1
+                and not self.model_config.mapping.enable_attention_dp):
+            combined = self._get_local_max_and_combined(logits)
+            gathered = allgather(combined, self.model_config.mapping, dim=-1)
             return self._get_draft_tokens_from_gathered(gathered)
-        elif (sampler_mapping is not None and sampler_mapping.tp_size > 1
-              and sampler_mapping.enable_lm_head_tp_in_adp):
+        elif (self.model_config is not None
+              and hasattr(self.model_config, 'mapping')
+              and self.model_config.mapping.tp_size > 1
+              and self.model_config.mapping.enable_lm_head_tp_in_adp):
             combined = self._get_local_max_and_combined(logits,
-                                                        sampler_mapping)
-            gathered = allgather(combined, sampler_mapping, dim=-1)
+                                                        mapping_lm_head_tp)
+            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
             batch_size = logits.shape[0]
-            local_batch_size = batch_size // sampler_mapping.tp_size
-            gathered = gathered.view(sampler_mapping.tp_size,
+            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
+            gathered = gathered.view(mapping_lm_head_tp.tp_size,
                                      local_batch_size, -1)
-            sliced_gathered = gathered[sampler_mapping.tp_rank]
+            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
             return self._get_draft_tokens_from_gathered(sliced_gathered)
         else:
             return self._draft_sampler_greedy(logits)
@@ -1431,8 +1209,6 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # MTP-Eagle + TP). draft_sampler() all-gathers the sharded logits
         # before argmax (and falls back to a plain argmax when no TP gather is
         # needed). Eagle3 (non-MTP) keeps its d2t-aware argmax.
-        lm_head_mapping = getattr(getattr(draft_model, 'lm_head', None),
-                                  'mapping', None)
         if spec_metadata.is_all_greedy_sample:
             # Only plain tensor parallelism (tp_size>1 without attention DP)
             # shards the draft logits over the vocab dim and thus needs
@@ -1442,8 +1218,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
             # d2t-aware argmax. (Routing ADP/LM-head-TP through draft_sampler
             # without its mapping_lm_head_tp arg hits the None-mapping branch
             # and crashes with 'NoneType has no attribute tp_group'.)
-            if self.is_mtp_eagle:
-                return self.draft_sampler(logits, lm_head_mapping)
+            if (self.is_mtp_eagle and self.model_config is not None
+                    and hasattr(self.model_config, 'mapping')
+                    and self.model_config.mapping.tp_size > 1
+                    and not self.model_config.mapping.enable_attention_dp):
+                return self.draft_sampler(logits)
             return self._draft_sampler_greedy(logits, d2t)
         # Non-greedy (advanced) draft sampling has the same TP hazard as the
         # greedy path: when the draft LM head is plain tensor-parallel
@@ -1455,10 +1234,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # shared seed. (Greedy uses draft_sampler()'s lighter max+index gather;
         # random sampling needs the full distribution. The LM-head-TP-in-ADP
         # case is handled upstream and must not be gathered again here.)
-        if (self.is_mtp_eagle and lm_head_mapping is not None
-                and lm_head_mapping.tp_size > 1
-                and not lm_head_mapping.enable_attention_dp):
-            logits = allgather(logits, lm_head_mapping, dim=-1)
+        if (self.is_mtp_eagle and self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size > 1
+                and not self.model_config.mapping.enable_attention_dp):
+            logits = allgather(logits, self.model_config.mapping, dim=-1)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             return self._draft_sampler_advanced_for_rejection(
                 logits, spec_metadata, batch_size, d2t, draft_step)

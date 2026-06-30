@@ -99,6 +99,71 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             attn_metadata.helix_is_inactive_rank.cpu(),
             torch.tensor([True, True, True, True, False]))
 
+    def test_helix_draft_logits_use_explicit_gather_ids(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        attn_metadata = SimpleNamespace(
+            num_seqs=3,
+            seq_lens_cuda=torch.tensor([2, 3, 1], dtype=torch.long),
+        )
+        hidden_states = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+        calls = []
+
+        class FakeMTPLayer:
+
+            def shared_head(self,
+                            hidden_states_arg,
+                            lm_head,
+                            attn_metadata_arg,
+                            return_context_logits=False):
+                calls.append((hidden_states_arg.clone(),
+                              return_context_logits))
+                return hidden_states_arg
+
+        logits, gather_ids = worker._draft_logits_for_sampling(
+            FakeMTPLayer(), hidden_states, SimpleNamespace(), attn_metadata)
+
+        expected_gather_ids = torch.tensor([1, 4, 5], dtype=torch.long)
+        torch.testing.assert_close(gather_ids, expected_gather_ids)
+        torch.testing.assert_close(logits, hidden_states[expected_gather_ids])
+        torch.testing.assert_close(calls[0][0], hidden_states[expected_gather_ids])
+        self.assertTrue(calls[0][1])
+
+    def test_non_helix_draft_logits_preserve_default_row_selection(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: False)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        attn_metadata = SimpleNamespace(
+            num_seqs=3,
+            seq_lens_cuda=torch.tensor([2, 3, 1], dtype=torch.long),
+        )
+        hidden_states = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+        calls = []
+
+        class FakeMTPLayer:
+
+            def shared_head(self,
+                            hidden_states_arg,
+                            lm_head,
+                            attn_metadata_arg,
+                            return_context_logits=False):
+                calls.append((hidden_states_arg.clone(),
+                              return_context_logits))
+                return hidden_states_arg
+
+        logits, gather_ids = worker._draft_logits_for_sampling(
+            FakeMTPLayer(), hidden_states, SimpleNamespace(), attn_metadata)
+
+        self.assertIsNone(gather_ids)
+        torch.testing.assert_close(logits, hidden_states)
+        torch.testing.assert_close(calls[0][0], hidden_states)
+        self.assertFalse(calls[0][1])
+
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []
 
