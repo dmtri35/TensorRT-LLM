@@ -53,7 +53,9 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+from ..modules.attention import (MLA, helix_cp_selective_reduce_rows,
+                                 helix_cp_selective_local_rows,
+                                 maybe_allgather_for_helix_cp,
                                  maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -1661,6 +1663,8 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: Optional[List[int]] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        helix_cp_gather_ids: Optional[torch.Tensor] = None,
+        helix_cp_reduce_selected_rows: bool = True,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -1741,9 +1745,18 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         else:
             hidden_states, _ = self.shared_head.norm(hidden_states, residual)
 
-        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
-                                                     attn_metadata,
-                                                     self.mapping_with_cp)
+        if helix_cp_gather_ids is not None:
+            if helix_cp_reduce_selected_rows:
+                hidden_states = helix_cp_selective_reduce_rows(
+                    hidden_states, helix_cp_gather_ids, attn_metadata,
+                    self.mapping_with_cp)
+            else:
+                hidden_states = helix_cp_selective_local_rows(
+                    hidden_states, helix_cp_gather_ids, attn_metadata,
+                    self.mapping_with_cp)
+        else:
+            hidden_states = maybe_allgather_for_helix_cp(
+                hidden_states, attn_metadata, self.mapping_with_cp)
 
         # It's for 2-model path, capture the hidden states
         if spec_metadata is not None:

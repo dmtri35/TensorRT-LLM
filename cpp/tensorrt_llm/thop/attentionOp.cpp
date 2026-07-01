@@ -360,6 +360,7 @@ public:
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+        bool const helix_is_inactive_rank_per_token,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         std::optional<torch::Tensor> spec_decoding_generation_lengths,
         std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
@@ -429,6 +430,7 @@ public:
         torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
         torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
         std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+        bool const helix_is_inactive_rank_per_token,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         std::optional<torch::Tensor> spec_decoding_generation_lengths,
         std::optional<torch::Tensor> spec_decoding_position_offsets_for_cpp,
@@ -526,9 +528,7 @@ public:
                 if (helix_is_inactive_rank.has_value())
                 {
                     mla_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
-                    // Speculative Helix verify passes one inactive flag per
-                    // query token; plain decode passes one flag per sequence.
-                    mla_params.helix_is_inactive_rank_per_token = (helix_is_inactive_rank->numel() == num_tokens);
+                    mla_params.helix_is_inactive_rank_per_token = helix_is_inactive_rank_per_token;
                 }
             }
             else
@@ -574,7 +574,7 @@ public:
             if (helix_is_inactive_rank.has_value())
             {
                 mla_params.helix_is_inactive_rank = helix_is_inactive_rank->data_ptr<bool>();
-                mla_params.helix_is_inactive_rank_per_token = (helix_is_inactive_rank->numel() == num_tokens);
+                mla_params.helix_is_inactive_rank_per_token = helix_is_inactive_rank_per_token;
             }
 
             mla_params.workspace = workspace_ptr;
@@ -1018,6 +1018,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+    bool const helix_is_inactive_rank_per_token,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
     bool const is_spec_decoding_enabled, bool const use_spec_decoding, bool const is_spec_dec_tree,
     std::optional<torch::Tensor> spec_decoding_generation_lengths,
@@ -1332,7 +1333,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
             cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
             latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
-            helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
+            helix_is_inactive_rank, helix_is_inactive_rank_per_token, softmax_stats_tensor, spec_decoding_generation_lengths,
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,
@@ -1354,7 +1355,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             max_context_q_len_override, kv_cache_block_offsets, host_kv_cache_pool_pointers, host_kv_cache_pool_mapping,
             cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale, rotary_inv_freq, rotary_cos_sin,
             latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin, mrope_position_deltas, helix_position_offsets,
-            helix_is_inactive_rank, softmax_stats_tensor, spec_decoding_generation_lengths,
+            helix_is_inactive_rank, helix_is_inactive_rank_per_token, softmax_stats_tensor, spec_decoding_generation_lengths,
             spec_decoding_position_offsets_for_cpp, spec_decoding_packed_mask, spec_decoding_bl_tree_mask_offset,
             spec_decoding_bl_tree_mask, spec_bl_tree_first_sparse_mask_offset_kv, attention_sinks, sparse_kv_indices,
             sparse_kv_offsets, sparse_attn_indices, sparse_attn_offsets, sparse_attn_indices_block_size,

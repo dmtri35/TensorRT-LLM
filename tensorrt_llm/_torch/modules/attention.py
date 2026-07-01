@@ -24,7 +24,7 @@ from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
 from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
-                           cp_allgather, reducescatter)
+                           cp_allgather, cp_allreduce_sum, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -336,6 +336,53 @@ def maybe_allgather_for_helix_cp(
         hidden_states = cp_allgather(hidden_states, mapping_with_cp, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
     return hidden_states
+
+
+def helix_cp_selective_reduce_rows(
+        hidden_states: torch.Tensor,
+        gather_ids: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        mapping_with_cp: Optional[Mapping],
+        reduce_fn=None) -> torch.Tensor:
+    """Restore selected global rows from a Helix CP reduce-scattered tensor."""
+    if gather_ids is None:
+        return maybe_allgather_for_helix_cp(hidden_states, attn_metadata,
+                                           mapping_with_cp)
+    if (mapping_with_cp is None or not mapping_with_cp.has_cp_helix()
+            or not mapping_with_cp.enable_attention_dp):
+        return hidden_states[gather_ids]
+
+    if reduce_fn is None:
+        reduce_fn = cp_allreduce_sum
+
+    local_selected = helix_cp_selective_local_rows(
+        hidden_states, gather_ids, attn_metadata, mapping_with_cp)
+    return reduce_fn(local_selected, mapping_with_cp)
+
+
+def helix_cp_selective_local_rows(
+        hidden_states: torch.Tensor, gather_ids: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        mapping_with_cp: Optional[Mapping]) -> torch.Tensor:
+    """Select global rows owned by this Helix CP rank and zero the rest."""
+    if (mapping_with_cp is None or not mapping_with_cp.has_cp_helix()
+            or not mapping_with_cp.enable_attention_dp):
+        return hidden_states[gather_ids]
+
+    num_selected = gather_ids.shape[0]
+    chunk_size = (attn_metadata.num_tokens + mapping_with_cp.cp_size -
+                  1) // mapping_with_cp.cp_size
+    if hidden_states.shape[0] == 0:
+        return hidden_states.new_zeros((num_selected, ) +
+                                       hidden_states.shape[1:])
+
+    local_start = mapping_with_cp.cp_rank * chunk_size
+    local_offsets = gather_ids - local_start
+    is_local = (local_offsets >= 0) & (local_offsets < hidden_states.shape[0])
+    local_selected = hidden_states[local_offsets.clamp(
+        0, hidden_states.shape[0] - 1)]
+    mask_shape = (num_selected, ) + (1, ) * (local_selected.dim() - 1)
+    return local_selected * is_local.reshape(mask_shape).to(local_selected.dtype)
 
 
 class Attention(nn.Module):

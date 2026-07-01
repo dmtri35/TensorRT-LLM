@@ -7,6 +7,8 @@ from parameterized import parameterized
 import tensorrt_llm
 from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
+from tensorrt_llm._torch.modules.attention import helix_cp_selective_reduce_rows
+from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
 from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
@@ -41,14 +43,103 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
             helix_total_input_len=torch.tensor([10, 20], dtype=torch.long),
             helix_position_offsets=torch.empty(num_tokens, dtype=torch.int32),
             helix_is_inactive_rank=torch.empty(num_tokens, dtype=torch.bool),
+            helix_is_inactive_rank_per_token=False,
         )
         position_ids = torch.tensor([10, 11, 20, 21, 22], dtype=torch.long)
 
-        worker._helix_draft_owner_mask(attn_metadata, position_ids, batch_size)
+        owner_counts = worker._helix_draft_owner_mask(attn_metadata,
+                                                      position_ids,
+                                                      batch_size)
 
         torch.testing.assert_close(
             attn_metadata.helix_is_inactive_rank,
             torch.tensor([True, True, True, True, False]))
+        torch.testing.assert_close(owner_counts,
+                                   torch.tensor([0, 1], dtype=torch.int32))
+        self.assertTrue(attn_metadata.helix_is_inactive_rank_per_token)
+
+    def test_update_helix_param_records_inactive_layout(self):
+        attn_metadata = TrtllmAttentionMetadata(
+            max_num_requests=2, max_num_tokens=8, kv_cache_manager=None)
+        attn_metadata.helix_position_offsets = torch.empty(8,
+                                                           dtype=torch.int32)
+        attn_metadata.helix_position_offsets_cpu = torch.empty_like(
+            attn_metadata.helix_position_offsets)
+        attn_metadata.helix_is_inactive_rank = torch.empty(8,
+                                                           dtype=torch.bool)
+        attn_metadata.helix_is_inactive_rank_cpu = torch.empty_like(
+            attn_metadata.helix_is_inactive_rank)
+
+        attn_metadata.update_helix_param(
+            helix_position_offsets=[10, 11],
+            helix_is_inactive_rank=[False, True],
+            helix_is_inactive_rank_per_token=False,
+        )
+        self.assertFalse(attn_metadata.helix_is_inactive_rank_per_token)
+
+        attn_metadata.update_helix_param(
+            helix_position_offsets=[12, 13, 14],
+            helix_is_inactive_rank=[False, True, False],
+            helix_is_inactive_rank_per_token=True,
+        )
+        self.assertTrue(attn_metadata.helix_is_inactive_rank_per_token)
+
+    def test_helix_cp_selective_reduce_rows_matches_full_rows(self):
+        num_tokens = 5
+        hidden_size = 3
+        cp_size = 2
+        gather_ids = torch.tensor([1, 4], dtype=torch.long)
+        full_hidden_states = torch.arange(num_tokens * hidden_size,
+                                          dtype=torch.float32).reshape(
+                                              num_tokens, hidden_size)
+        chunk_size = (num_tokens + cp_size - 1) // cp_size
+        padded = torch.nn.functional.pad(
+            full_hidden_states, (0, 0, 0, chunk_size * cp_size - num_tokens))
+        rank_major_gathered = torch.stack([
+            padded[rank * chunk_size:(rank + 1) * chunk_size]
+            for rank in range(cp_size)
+        ]).reshape(cp_size * chunk_size, hidden_size)
+
+        def selected_contributions_by_rank():
+            selected_by_rank = []
+            for rank in range(cp_size):
+                local_chunk = rank_major_gathered[rank * chunk_size:(rank + 1)
+                                                  * chunk_size]
+                local_start = rank * chunk_size
+                local_offsets = gather_ids - local_start
+                is_local = (local_offsets >= 0) & (local_offsets < chunk_size)
+                selected = local_chunk[local_offsets.clamp(0, chunk_size - 1)]
+                selected_by_rank.append(selected * is_local.unsqueeze(-1))
+            return selected_by_rank
+
+        all_contributions = selected_contributions_by_rank()
+        expected = full_hidden_states[gather_ids]
+        for cp_rank in range(cp_size):
+            reduce_inputs = []
+
+            def fake_reduce(tensor, mapping):
+                reduce_inputs.append(tensor.clone())
+                return torch.stack(all_contributions).sum(dim=0)
+
+            mapping = SimpleNamespace(cp_size=cp_size,
+                                      cp_rank=cp_rank,
+                                      enable_attention_dp=True,
+                                      has_cp_helix=lambda: True)
+            local_chunk = padded[cp_rank * chunk_size:(cp_rank + 1) *
+                                 chunk_size]
+            attn_metadata = SimpleNamespace(num_tokens=num_tokens)
+            with self.subTest(cp_rank=cp_rank):
+                selected = helix_cp_selective_reduce_rows(
+                    local_chunk,
+                    gather_ids,
+                    attn_metadata,
+                    mapping,
+                    reduce_fn=fake_reduce,
+                )
+                torch.testing.assert_close(reduce_inputs[0],
+                                           all_contributions[cp_rank])
+                torch.testing.assert_close(selected, expected)
+
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_helix_draft_owner_mask_cuda_graph_safe(self):
         mapping = SimpleNamespace(cp_size=2,
@@ -98,6 +189,247 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         torch.testing.assert_close(
             attn_metadata.helix_is_inactive_rank.cpu(),
             torch.tensor([True, True, True, True, False]))
+
+    def test_helix_draft_logits_use_explicit_gather_ids(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        attn_metadata = SimpleNamespace(
+            num_seqs=3,
+            seq_lens_cuda=torch.tensor([2, 3, 1], dtype=torch.long),
+        )
+        hidden_states = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+        calls = []
+
+        class FakeMTPLayer:
+
+            def shared_head(self,
+                            hidden_states_arg,
+                            lm_head,
+                            attn_metadata_arg,
+                            return_context_logits=False):
+                calls.append((hidden_states_arg.clone(),
+                              return_context_logits))
+                return hidden_states_arg
+
+        logits, gather_ids, sampler_mapping = worker._draft_logits_for_sampling(
+            FakeMTPLayer(), hidden_states, SimpleNamespace(), attn_metadata)
+
+        expected_gather_ids = torch.tensor([1, 4, 5], dtype=torch.long)
+        torch.testing.assert_close(gather_ids, expected_gather_ids)
+        torch.testing.assert_close(logits, hidden_states[expected_gather_ids])
+        torch.testing.assert_close(calls[0][0], hidden_states[expected_gather_ids])
+        self.assertTrue(calls[0][1])
+        self.assertIsNone(sampler_mapping)
+
+    def test_helix_draft_logits_return_shared_head_sampler_mapping(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        attn_metadata = SimpleNamespace(
+            num_seqs=1,
+            seq_lens_cuda=torch.tensor([2], dtype=torch.long),
+        )
+        hidden_states = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        sampler_mapping = SimpleNamespace(tp_size=2)
+
+        class FakeSharedHead:
+            mapping_lm_head_tp = sampler_mapping
+
+            def __call__(self,
+                         hidden_states_arg,
+                         lm_head,
+                         attn_metadata_arg,
+                         return_context_logits=False):
+                return hidden_states_arg
+
+        fake_mtp_layer = SimpleNamespace(shared_head=FakeSharedHead())
+
+        logits, gather_ids, returned_mapping = worker._draft_logits_for_sampling(
+            fake_mtp_layer, hidden_states, SimpleNamespace(), attn_metadata)
+
+        torch.testing.assert_close(logits, hidden_states[[1]])
+        torch.testing.assert_close(gather_ids, torch.tensor([1]))
+        self.assertIs(returned_mapping, sampler_mapping)
+
+    def test_helix_draft_logits_preserve_selected_hidden_states(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        attn_metadata = SimpleNamespace(
+            num_seqs=2,
+            seq_lens_cuda=torch.tensor([2, 3], dtype=torch.long),
+        )
+        selected_hidden_states = torch.arange(8, dtype=torch.float32).reshape(
+            2, 4)
+        gather_ids = torch.tensor([1, 4], dtype=torch.long)
+
+        calls = []
+
+        class FakeMTPLayer:
+
+            def shared_head(self,
+                            hidden_states_arg,
+                            lm_head,
+                            attn_metadata_arg,
+                            return_context_logits=False):
+                calls.append((hidden_states_arg.clone(),
+                              return_context_logits))
+                return hidden_states_arg
+
+        logits, returned_gather_ids, sampler_mapping = worker._draft_logits_for_sampling(
+            FakeMTPLayer(),
+            selected_hidden_states,
+            SimpleNamespace(),
+            attn_metadata,
+            gather_ids,
+            hidden_states_are_selected=True)
+
+        torch.testing.assert_close(logits, selected_hidden_states)
+        torch.testing.assert_close(calls[0][0], selected_hidden_states)
+        torch.testing.assert_close(returned_gather_ids, gather_ids)
+        self.assertTrue(calls[0][1])
+        self.assertIsNone(sampler_mapping)
+
+    def test_mtp_eagle_forwards_helix_selected_rows_to_mtp_layer(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPEagleWorker(MTPDecodingConfig(max_draft_len=2),
+                                model_config=model_config)
+        self.assertTrue(worker.is_mtp_eagle)
+
+        class FakeMTPLayer:
+
+            def __init__(self):
+                self.calls = []
+
+            def __call__(self, **kwargs):
+                self.calls.append(kwargs)
+                return kwargs["hidden_states"]
+
+        fake_mtp_layer = FakeMTPLayer()
+        draft_model = SimpleNamespace(mtp_layers=[fake_mtp_layer],
+                                      embed_tokens=object())
+        inputs = {
+            "input_ids": torch.tensor([1, 2], dtype=torch.int32),
+            "position_ids": torch.tensor([10, 11], dtype=torch.long),
+            "hidden_states": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+            "attn_metadata": SimpleNamespace(),
+        }
+        spec_metadata = SimpleNamespace(all_rank_num_tokens=[2],
+                                        subseq_all_rank_num_tokens=[1])
+        gather_ids = torch.tensor([1], dtype=torch.long)
+
+        hidden_states, hidden_states_to_save = worker._run_draft_forward(
+            draft_model,
+            inputs,
+            spec_metadata,
+            step_idx=0,
+            helix_cp_gather_ids=gather_ids,
+            helix_cp_reduce_selected_rows=True)
+
+        self.assertIsNone(hidden_states_to_save)
+        torch.testing.assert_close(hidden_states, inputs["hidden_states"])
+        self.assertEqual(len(fake_mtp_layer.calls), 1)
+        self.assertIs(fake_mtp_layer.calls[0]["helix_cp_gather_ids"],
+                      gather_ids)
+        self.assertTrue(
+            fake_mtp_layer.calls[0]["helix_cp_reduce_selected_rows"])
+
+    def test_helix_select_cp_owner_values_uses_owner_rank_rows(self):
+        attn_metadata = SimpleNamespace(num_tokens=5)
+        gather_ids = torch.tensor([1, 4], dtype=torch.long)
+        per_rank_values = [
+            torch.tensor([11, -1], dtype=torch.int32),
+            torch.tensor([-2, 44], dtype=torch.int32),
+        ]
+        per_rank_expected_inputs = [
+            torch.tensor([11, 0], dtype=torch.int32),
+            torch.tensor([0, 44], dtype=torch.int32),
+        ]
+        expected = torch.tensor([11, 44], dtype=torch.int32)
+
+        for cp_rank in range(2):
+            mapping = SimpleNamespace(cp_size=2,
+                                      cp_rank=cp_rank,
+                                      enable_attention_dp=True,
+                                      has_cp_helix=lambda: True)
+            model_config = SimpleNamespace(mapping=mapping)
+            worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                               model_config=model_config)
+            reduce_inputs = []
+
+            def fake_reduce(values, mapping):
+                reduce_inputs.append(values.clone())
+                return expected
+
+            with self.subTest(cp_rank=cp_rank):
+                selected = worker._helix_select_cp_owner_values(
+                    per_rank_values[cp_rank],
+                    gather_ids,
+                    attn_metadata,
+                    reduce_fn=fake_reduce)
+                torch.testing.assert_close(reduce_inputs[0],
+                                           per_rank_expected_inputs[cp_rank])
+                torch.testing.assert_close(selected, expected)
+
+    def test_helix_select_cp_owner_values_skips_non_adp(self):
+        mapping = SimpleNamespace(cp_size=2,
+                                  cp_rank=0,
+                                  enable_attention_dp=False,
+                                  has_cp_helix=lambda: True)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        values = torch.tensor([11, 22], dtype=torch.int32)
+
+        def fail_reduce(values, mapping):
+            raise AssertionError("non-ADP Helix should not reduce token IDs")
+
+        selected = worker._helix_select_cp_owner_values(
+            values,
+            torch.tensor([1, 4], dtype=torch.long),
+            SimpleNamespace(num_tokens=5),
+            reduce_fn=fail_reduce)
+
+        torch.testing.assert_close(selected, values)
+
+    def test_non_helix_draft_logits_preserve_default_row_selection(self):
+        mapping = SimpleNamespace(has_cp_helix=lambda: False)
+        model_config = SimpleNamespace(mapping=mapping)
+        worker = MTPWorker(MTPDecodingConfig(max_draft_len=2),
+                           model_config=model_config)
+        attn_metadata = SimpleNamespace(
+            num_seqs=3,
+            seq_lens_cuda=torch.tensor([2, 3, 1], dtype=torch.long),
+        )
+        hidden_states = torch.arange(24, dtype=torch.float32).reshape(6, 4)
+
+        calls = []
+
+        class FakeMTPLayer:
+
+            def shared_head(self,
+                            hidden_states_arg,
+                            lm_head,
+                            attn_metadata_arg,
+                            return_context_logits=False):
+                calls.append((hidden_states_arg.clone(),
+                              return_context_logits))
+                return hidden_states_arg
+
+        logits, gather_ids, sampler_mapping = worker._draft_logits_for_sampling(
+            FakeMTPLayer(), hidden_states, SimpleNamespace(), attn_metadata)
+
+        self.assertIsNone(gather_ids)
+        self.assertIsNone(sampler_mapping)
+        torch.testing.assert_close(logits, hidden_states)
+        torch.testing.assert_close(calls[0][0], hidden_states)
+        self.assertFalse(calls[0][1])
 
     def load_sample_and_accept_draft_tokens_test_cases():
         test_cases = []

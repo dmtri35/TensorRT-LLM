@@ -2673,7 +2673,8 @@ class PyTorchModelEngine(ModelEngine):
             num_extend_ctx_requests: int = 0,
             helix_position_offsets: Optional[List[int]] = None,
             helix_is_inactive_rank: Optional[List[bool]] = None,
-            helix_total_input_len: Optional[List[int]] = None):
+            helix_total_input_len: Optional[List[int]] = None,
+            helix_is_inactive_rank_per_token: bool = False):
         """
         Common metadata preparation logic for incremental updates.
         """
@@ -2695,6 +2696,8 @@ class PyTorchModelEngine(ModelEngine):
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
                 helix_total_input_len=helix_total_input_len,
+                helix_is_inactive_rank_per_token=
+                helix_is_inactive_rank_per_token,
             )
 
         # Create KV cache params and prepare metadata
@@ -2859,7 +2862,8 @@ class PyTorchModelEngine(ModelEngine):
             num_extend_ctx_requests=0,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
-            helix_total_input_len=helix_total_input_len)
+            helix_total_input_len=helix_total_input_len,
+            helix_is_inactive_rank_per_token=has_cp_helix)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
@@ -2906,8 +2910,7 @@ class PyTorchModelEngine(ModelEngine):
             self.num_accepted_draft_tokens_cuda[idx_accepted_tokens] + 1)
 
         self.num_accepted_draft_tokens_cuda[:num_extend_reqeust_wo_dummy].copy_(
-            num_accepted_tokens_device[
-                previous_slots[:num_extend_reqeust_wo_dummy]],
+            num_accepted_tokens_device[:num_extend_reqeust_wo_dummy],
             non_blocking=True)
 
         # Initialize offset tensors to zeros
@@ -3083,7 +3086,8 @@ class PyTorchModelEngine(ModelEngine):
             num_extend_ctx_requests=num_extend_ctx_requests,
             helix_position_offsets=helix_position_offsets,
             helix_is_inactive_rank=helix_is_inactive_rank,
-            helix_total_input_len=helix_total_input_len)
+            helix_total_input_len=helix_total_input_len,
+            helix_is_inactive_rank_per_token=has_cp_helix)
 
         # No padding because there are only generation requests.
         attn_metadata.padded_num_tokens = None
@@ -3239,6 +3243,7 @@ class PyTorchModelEngine(ModelEngine):
         _helix_tokens_per_block = (kv_cache_manager.tokens_per_block
                                    if _has_cp_helix
                                    and kv_cache_manager is not None else None)
+        helix_is_inactive_rank_per_token = False
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -3258,6 +3263,7 @@ class PyTorchModelEngine(ModelEngine):
                 helix_position_offsets.extend(ctx_position_ids)
                 helix_is_inactive_rank.extend([False] * len(prompt_tokens))
                 helix_total_input_len.append(request.total_input_len_cp)
+                helix_is_inactive_rank_per_token |= len(prompt_tokens) != 1
 
             # Start offset of this request's (current-chunk) tokens within the
             # flattened input_ids. Recorded on multimodal_params below so models
@@ -3463,12 +3469,7 @@ class PyTorchModelEngine(ModelEngine):
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.extend(inactive_h)
                     helix_total_input_len.append(request.total_input_len_cp)
-                elif not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    assert num_draft_tokens == spec_tree_manager.max_total_draft_tokens
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[0])
+                    helix_is_inactive_rank_per_token = True
                 else:
                     position_ids.extend(
                         list(
@@ -3501,11 +3502,7 @@ class PyTorchModelEngine(ModelEngine):
                     helix_position_offsets.extend(positions_h)
                     helix_is_inactive_rank.extend(inactive_h)
                     helix_total_input_len.append(request.total_input_len_cp)
-                elif not self.is_draft_model and not spec_config.is_linear_tree:
-                    assert spec_tree_manager is not None
-                    position_ids.extend(
-                        past_seen_token_num +
-                        spec_tree_manager.spec_dec_position_offsets[0])
+                    helix_is_inactive_rank_per_token = True
                 else:
                     position_ids.extend(
                         list(
@@ -3547,6 +3544,7 @@ class PyTorchModelEngine(ModelEngine):
                 helix_position_offsets.extend(positions_h)
                 helix_is_inactive_rank.extend(inactive_h)
                 helix_total_input_len.append(request.total_input_len_cp)
+                helix_is_inactive_rank_per_token = True
             else:
                 position_ids.extend(
                     range(begin_compute, begin_compute + len(prompt_tokens)))
@@ -4043,6 +4041,8 @@ class PyTorchModelEngine(ModelEngine):
                 helix_position_offsets=helix_position_offsets,
                 helix_is_inactive_rank=helix_is_inactive_rank,
                 helix_total_input_len=helix_total_input_len,
+                helix_is_inactive_rank_per_token=
+                helix_is_inactive_rank_per_token,
             )
 
         num_generation_requests = len(gen_request_seq_slots)

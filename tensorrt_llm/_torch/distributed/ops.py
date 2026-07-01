@@ -336,6 +336,47 @@ def cp_allgather(
                       dim, sizes)
 
 
+def cp_allreduce_sum(input: torch.Tensor, mapping: Mapping) -> torch.Tensor:
+    '''
+    Add an operation that performs a SUM all-reduce across the CP group.
+
+    This is the CP equivalent of the unfused NCCL path in ``AllReduce``.  It is
+    intentionally narrow: Helix MTP uses it for selected rows where exactly one
+    CP rank contributes a non-zero value and every rank needs the summed row.
+    '''
+    if mapping.cp_size == 1:
+        return input
+
+    input = input.contiguous()
+    disable_mpi = mpi_disabled()
+    all_reduce_op = (torch.ops.trtllm.allreduce_pg
+                     if disable_mpi else torch.ops.trtllm.allreduce)
+    additional_args = {}
+    if disable_mpi:
+        pg = mapping.cp_group_pg
+        assert pg is not None, "CP ProcessGroup not initialised"
+        additional_args = {
+            "rank": torch.distributed.get_rank(),
+            "pg": pg.boxed(),
+        }
+
+    output = all_reduce_op(
+        input=input,
+        residual=None,
+        norm_weight=None,
+        scale=None,
+        bias=None,
+        workspace=None,
+        group=mapping.cp_group,
+        strategy=AllReduceStrategy.NCCL,
+        op=AllReduceFusionOp.NONE,
+        eps=1e-6,
+        trigger_completion_at_end=False,
+        **additional_args,
+    )
+    return output if len(output) > 1 else output[0]
+
+
 def alltoall_helix(
     inputs: List[torch.Tensor],
     group: List[int],

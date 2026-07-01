@@ -1071,6 +1071,7 @@ def _handle_prefill_thop(
         None,  # mrope_position_deltas
         None,  # helix_position_offsets
         None,  # helix_is_inactive_rank
+        False,  # helix_is_inactive_rank_per_token
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
         False,  # is_spec_decoding_enabled
@@ -1364,6 +1365,7 @@ def _handle_prefill_thop_cached_kv(
             None,  # mrope_position_deltas
             None,  # helix_position_offsets
             None,  # helix_is_inactive_rank
+            False,  # helix_is_inactive_rank_per_token
             None,  # attention_chunk_size
             temp_softmax_stats,  # softmax_stats_tensor (per-iteration output)
             False,  # is_spec_decoding_enabled
@@ -1494,6 +1496,7 @@ def _handle_prefill_thop_cached_kv(
         None,  # mrope_position_deltas
         None,  # helix_position_offsets
         None,  # helix_is_inactive_rank
+        False,  # helix_is_inactive_rank_per_token
         None,  # attention_chunk_size
         temp_softmax_stats,  # softmax_stats_tensor
         False,  # is_spec_decoding_enabled
@@ -1685,6 +1688,7 @@ def _handle_decode_impl(
         qk_rope_head_dim,
         kv_lora_rank,  # v_head_dim (in latent space = kv_lora_rank)
         True,  # rope_append
+        False,  # helix_is_inactive_rank_per_token
     )
 
     output_latent = planner.output_latent[:num_tokens]
@@ -1755,6 +1759,7 @@ def _handle_decode_impl(
         None,  # mrope_position_deltas
         None,  # helix_position_offsets
         None,  # helix_is_inactive_rank
+        False,  # helix_is_inactive_rank_per_token
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
         False,  # is_spec_decoding_enabled

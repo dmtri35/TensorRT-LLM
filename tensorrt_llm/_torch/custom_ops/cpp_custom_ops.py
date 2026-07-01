@@ -1234,6 +1234,7 @@ def _register_fake():
         qk_rope_head_dim: int,
         v_head_dim: int,
         rope_append: bool,
+        helix_is_inactive_rank_per_token: bool,
     ) -> None:
         # This is a fake implementation for shape inference
         # The actual operation modifies fused_q and q_pe in-place

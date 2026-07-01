@@ -139,9 +139,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     # token. Inactive ranks use the query token without appending it to local KV.
     helix_is_inactive_rank: Optional[torch.Tensor] = None
     helix_is_inactive_rank_cpu: Optional[torch.Tensor] = None
+    helix_is_inactive_rank_per_token: bool = False
     helix_total_input_len: Optional[torch.Tensor] = None
     helix_total_input_len_cpu: Optional[torch.Tensor] = None
-    helix_param_len_for_cpp: int = 0
 
     # Block offsets for the target and draft KV caches
     kv_cache_block_offsets: Optional[torch.Tensor] = None
@@ -178,20 +178,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 return self.spec_decoding_position_offsets_cpp
             return offsets.view(self.max_num_requests, -1)
         return offsets
-
-    @property
-    def helix_position_offsets_for_cpp(self) -> Optional[torch.Tensor]:
-        offsets = self.helix_position_offsets
-        if offsets is None:
-            return None
-        return offsets[:self.helix_param_len_for_cpp]
-
-    @property
-    def helix_is_inactive_rank_for_cpp(self) -> Optional[torch.Tensor]:
-        inactive_rank = self.helix_is_inactive_rank
-        if inactive_rank is None:
-            return None
-        return inactive_rank[:self.helix_param_len_for_cpp]
 
     @property
     def max_context_length(self) -> int:
@@ -492,6 +478,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         helix_position_offsets: List[int],
         helix_is_inactive_rank: List[bool],
         helix_total_input_len: Optional[List[int]] = None,
+        helix_is_inactive_rank_per_token: bool = False,
     ) -> None:
         """
         Update helix parameters by copying into static buffers for CUDA graph compatibility.
@@ -500,7 +487,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             helix_position_offsets: Position offsets for helix parallelism with shape (num_tokens,).
             helix_is_inactive_rank: Whether the current rank is inactive with shape (num_tokens,).
             helix_total_input_len: Global input length before decode, with shape (batch_size,).
+            helix_is_inactive_rank_per_token: Whether inactive flags are packed by query token.
         """
+        self.helix_is_inactive_rank_per_token = helix_is_inactive_rank_per_token
+
         if helix_position_offsets is not None and self.helix_position_offsets is not None:
             num_tokens = len(helix_position_offsets)
             self.helix_position_offsets_cpu[:num_tokens].copy_(
@@ -567,11 +557,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             # If helix is inactive, attend to the previously cached tokens only.
             assert cached_token_lens is not None, "cached_token_lens should be set for helix"
             kv_lens = cached_token_lens.clone()
-            total_q_len = int(self.seq_lens_kv[:self.num_seqs].sum().item())
-            use_owned_token_counts = (self.helix_is_inactive_rank_cpu is not None
-                                      and self.helix_is_inactive_rank_cpu.numel()
-                                      >= total_q_len)
-            if use_owned_token_counts:
+            if self.helix_is_inactive_rank_per_token:
                 kv_lens += self._helix_owned_token_counts()
             else:
                 active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
@@ -1636,9 +1622,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         self.local_layer_idx = self.get_local_layer_idx(metadata)
         if metadata.spec_decoding_bl_tree_mask is not None and self.local_layer_idx == 0:
             metadata.spec_decoding_bl_tree_mask.zero_()
-        metadata.helix_param_len_for_cpp = (
-            q.shape[0] if self.is_mla_enable else batch_size)
-
         if self.print_skip_softmax_stat:
             self.skip_softmax_stat.zero_()
 
@@ -1766,7 +1749,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_quant_orig,
+            None,  # kv_scale_quant_orig
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
@@ -1811,7 +1794,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_quant_orig,
+            None,  # kv_scale_quant_orig
             self.get_local_layer_idx(metadata),
             self.mla_params.kv_lora_rank,
             self.mla_params.qk_rope_head_dim,
@@ -1854,7 +1837,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
+            None,  # kv_scale_orig_quant
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,
@@ -1971,8 +1954,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             metadata.kv_cache_block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
-            self.kv_scale_quant_orig,
+            None,  # kv_scale_orig_quant
+            None,  # kv_scale_quant_orig
             out_scale,
             metadata.block_ids_per_seq,
             helix_tensor_params,
@@ -1992,4 +1975,5 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.qk_rope_head_dim,
             self.v_head_dim,
             self.rope_append,
+            metadata.helix_is_inactive_rank_per_token,
         )

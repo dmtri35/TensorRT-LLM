@@ -667,9 +667,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             # For Helix CP, inactive ranks only attend to previously cached
             # tokens (no new token appended), while active ranks add new tokens.
             # This mirrors the kv_lens logic in TrtllmAttentionMetadata.prepare().
-            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
             kv_lens = cached_token_lens.clone()
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            if self.helix_is_inactive_rank_per_token:
+                kv_lens += self._helix_owned_token_counts()
+            else:
+                active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+                kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv
 
@@ -1441,9 +1444,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             device='cpu',
         )
         if self.enable_helix:
-            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
             kv_lens = cached_token_lens.clone()
-            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+            if self.helix_is_inactive_rank_per_token:
+                kv_lens += self._helix_owned_token_counts()
+            else:
+                active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+                kv_lens[active_rank] += self.seq_lens_kv[active_rank]
         else:
             kv_lens = cached_token_lens + self.seq_lens_kv
         tokens_per_block = self.kv_cache_manager.tokens_per_block
@@ -2992,7 +2998,7 @@ class DSATrtllmAttention(TrtllmAttention):
             block_offsets,
             metadata.kv_cache_manager.kv_cache_pool_pointers,
             metadata.kv_cache_manager.kv_cache_pool_mapping,
-            self.kv_scale_orig_quant,
+            None,  # kv_scale_orig_quant
             self.get_local_layer_idx(metadata),
             metadata.kv_cache_manager.tokens_per_block,
             metadata.kv_cache_manager.max_seq_len,

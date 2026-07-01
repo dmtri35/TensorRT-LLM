@@ -379,6 +379,11 @@ __device__ __forceinline__ int helixKvWriteSlot(bool const* helix_is_inactive_ra
         return -1;
     }
 
+    if (seq_len == 1)
+    {
+        return kv_cache_len - 1;
+    }
+
     // Per-token Helix flags are packed sequence-major with the uniform
     // generation seq_len enforced by invokeMLARopeGeneration.
     int owned_token_count = 0;
@@ -471,9 +476,17 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
             auto batch_idx = global_token_idx / seq_len;
             auto local_token_idx = global_token_idx % seq_len;
             bool const valid_token = global_token_idx < total_s_len;
+            auto token_kv_idx = -1;
+            bool process_token = valid_token;
+            if (valid_token && head_idx == head_num)
+            {
+                token_kv_idx = helixKvWriteSlot(helix_is_inactive_rank, helix_is_inactive_rank_per_token,
+                    global_token_idx, batch_idx, local_token_idx, seq_len, kv_cache_lengths[batch_idx]);
+                process_token = token_kv_idx >= 0;
+            }
             VecT data;
 
-            if (valid_token)
+            if (process_token)
             {
 
                 auto const position_id
@@ -509,31 +522,21 @@ __global__ void applyMLARopeAndAssignQKVKernelGeneration(T* qkv_output, T* q_pe,
 
             __syncwarp();
 
-            if (valid_token)
+            if (process_token)
             {
                 if (head_idx == head_num)
                 {
-                    auto const token_kv_idx = helixKvWriteSlot(helix_is_inactive_rank,
-                        helix_is_inactive_rank_per_token, global_token_idx, batch_idx, local_token_idx, seq_len,
-                        kv_cache_lengths[batch_idx]);
-                    if (token_kv_idx >= 0)
+                    auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
+                    auto inBlockIdx = kv_cache.getKVLocalIdx(
+                        token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
+                    if (cache_type == KvCacheDataType::FP8)
                     {
-
-                        {
-                            auto kDst = reinterpret_cast<T*>(kv_cache.getKBlockPtr(batch_idx, token_kv_idx));
-                            auto inBlockIdx = kv_cache.getKVLocalIdx(
-                                token_kv_idx, 0, TOTAL_VEC_PER_HEAD, K_VECS_PER_HEAD + head_dim_vec_idx);
-                            if (cache_type == KvCacheDataType::FP8)
-                            {
-
-                                quantCopy<T, ELTS_PER_VEC>(
-                                    reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
-                                    reinterpret_cast<T const*>(&data), quant_scale_kv_val);
-                            }
-                            else
-                                reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
-                        }
+                        quantCopy<T, ELTS_PER_VEC>(
+                            reinterpret_cast<__nv_fp8_e4m3*>(kDst) + inBlockIdx * ELTS_PER_VEC,
+                            reinterpret_cast<T const*>(&data), quant_scale_kv_val);
                     }
+                    else
+                        reinterpret_cast<VecT*>(kDst)[inBlockIdx] = data;
                 }
                 else
                 {

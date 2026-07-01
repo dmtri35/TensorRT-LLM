@@ -69,6 +69,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim, std::optional<bool> rope_append,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> helix_position_offsets, std::optional<torch::Tensor> helix_is_inactive_rank,
+    bool const helix_is_inactive_rank_per_token,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
     bool const is_spec_decoding_enabled, bool const use_spec_decoding, bool const is_spec_dec_tree,
     std::optional<torch::Tensor> spec_decoding_generation_lengths,

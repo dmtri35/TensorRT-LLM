@@ -8,7 +8,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather, cp_allgather
+from ..distributed.ops import allgather, cp_allreduce_sum
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -146,16 +146,6 @@ def _helix_rejected_owned_tensor(inactive_rank, num_accepted_tokens,
     rejected = token_indices >= num_accepted_tokens[
         num_contexts:batch_size].unsqueeze(1)
     return ((~gen_flags) & rejected).sum(dim=1)
-
-
-@torch.compile(options={"max-autotune": True})
-def _helix_sync_draft_token_from_gathered(gathered_tokens, owner_rank,
-                                          num_gens: int):
-    gen_indices = torch.arange(num_gens,
-                               dtype=torch.long,
-                               device=gathered_tokens.device)
-    gathered_indices = owner_rank.to(torch.long) * num_gens + gen_indices
-    return gathered_tokens[gathered_indices]
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:
@@ -403,61 +393,41 @@ class MTPSampler(SpecSamplerBase):
         return args.max_total_draft_tokens
 
 
-class MTPWorker(SpecWorkerBase):
+class HelixMTPWorkerMixin:
+    """Shared Helix CP helpers for MTP-style draft workers."""
 
-    def __init__(self,
-                 spec_config: "MTPDecodingConfig",
-                 model_config=None,
-                 use_separate_draft_kv_cache: bool = False):
-        super().__init__(use_separate_draft_kv_cache)
-        self.spec_config = spec_config
-        self.model_config = model_config
-        self.is_thop = False
-        self.sa_enhancer: Optional[SADraftEnhancer] = None
-        if spec_config.sa_config is not None:
-            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
-
-    @property
-    def max_draft_len(self) -> int:
-        return self.spec_config.max_draft_len
-
-
-    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
-        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
-        # Save kv_lens_cuda values separately instead of routing through
-        # prepare_for_spec_dec, which would clone the tensor and break the
-        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
-        batch_size = attn_metadata.num_seqs
-        if hasattr(attn_metadata, 'kv_lens_cuda'):
-            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
-                                                                  batch_size].clone(
-                                                                  )
-        else:
-            self._saved_kv_lens_cuda = None
+    def _save_helix_attn_metadata_for_spec_dec(self, attn_metadata) -> None:
         self._saved_helix_position_offsets = None
         self._saved_helix_is_inactive_rank = None
+        self._saved_helix_is_inactive_rank_per_token = getattr(
+            attn_metadata, 'helix_is_inactive_rank_per_token', False)
+        self._saved_helix_num_tokens = getattr(attn_metadata, 'num_tokens', 0)
         if getattr(attn_metadata, 'helix_position_offsets', None) is not None:
-            self._saved_helix_position_offsets = attn_metadata.helix_position_offsets.clone(
-            )
+            self._saved_helix_position_offsets = attn_metadata.helix_position_offsets[
+                :self._saved_helix_num_tokens].clone()
         if getattr(attn_metadata, 'helix_is_inactive_rank', None) is not None:
-            self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank.clone(
-            )
+            self._saved_helix_is_inactive_rank = attn_metadata.helix_is_inactive_rank[
+                :self._saved_helix_num_tokens].clone()
 
-    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
-        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
-        if self._saved_kv_lens_cuda is not None:
-            batch_size = self._saved_kv_lens_cuda.shape[0]
-            attn_metadata.kv_lens_cuda[:batch_size].copy_(
-                self._saved_kv_lens_cuda)
-            self._saved_kv_lens_cuda = None
+    def _restore_helix_attn_metadata_from_spec_dec(self,
+                                                   attn_metadata) -> None:
         if self._saved_helix_position_offsets is not None:
-            attn_metadata.helix_position_offsets.copy_(
+            num_tokens = self._saved_helix_num_tokens
+            attn_metadata.helix_position_offsets[:num_tokens].copy_(
                 self._saved_helix_position_offsets)
             self._saved_helix_position_offsets = None
         if self._saved_helix_is_inactive_rank is not None:
-            attn_metadata.helix_is_inactive_rank.copy_(
+            num_tokens = self._saved_helix_num_tokens
+            attn_metadata.helix_is_inactive_rank[:num_tokens].copy_(
                 self._saved_helix_is_inactive_rank)
             self._saved_helix_is_inactive_rank = None
+        if hasattr(attn_metadata, 'helix_is_inactive_rank_per_token'):
+            attn_metadata.helix_is_inactive_rank_per_token = self._saved_helix_is_inactive_rank_per_token
+        self._saved_helix_num_tokens = 0
+
+    def _has_helix_cp(self) -> bool:
+        mapping = getattr(getattr(self, "model_config", None), "mapping", None)
+        return mapping is not None and mapping.has_cp_helix()
 
     def _helix_draft_owner_mask(self, attn_metadata, position_ids, batch_size):
         mapping = getattr(self.model_config, "mapping", None)
@@ -475,14 +445,16 @@ class MTPWorker(SpecWorkerBase):
             attn_metadata.helix_position_offsets[:batch_size].copy_(
                 positions.to(torch.int32))
             attn_metadata.helix_is_inactive_rank[:batch_size].copy_(~owner)
+            if hasattr(attn_metadata, 'helix_is_inactive_rank_per_token'):
+                attn_metadata.helix_is_inactive_rank_per_token = False
             return owner
 
         positions = positions[:attn_metadata.num_tokens]
         num_tokens = positions.shape[0]
         seq_lens = attn_metadata.seq_lens_cuda[:batch_size].to(torch.long)
         if num_tokens != attn_metadata.num_tokens:
-            # The first MTP-Eagle draft pass omits the target golden token for
-            # generation requests while attn_metadata still tracks target rows.
+            # The first draft pass omits the target golden token for generation
+            # requests while attn_metadata still tracks target rows.
             seq_lens = seq_lens.clone()
             seq_lens[attn_metadata.num_contexts:batch_size] -= 1
         owner_counts, inactive_rank = _helix_draft_owner_rows_tensor(
@@ -498,6 +470,8 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata.helix_position_offsets[:num_tokens].copy_(
             positions.to(torch.int32))
         attn_metadata.helix_is_inactive_rank[:num_tokens].copy_(inactive_rank)
+        if hasattr(attn_metadata, 'helix_is_inactive_rank_per_token'):
+            attn_metadata.helix_is_inactive_rank_per_token = True
         return owner_counts
 
     def _helix_accepted_owner_counts(self, attn_metadata, num_accepted_tokens,
@@ -552,44 +526,103 @@ class MTPWorker(SpecWorkerBase):
                 accepted_owner_counts[:num_contexts])
         return kv_lens_delta
 
-    def _helix_sync_new_draft_token(self, new_draft_token, target_position_ids,
-                                    num_accepted_tokens, attn_metadata,
-                                    draft_step: int):
+    def _helix_draft_gather_ids(self, attn_metadata, last_tokens_idx=None):
         mapping = getattr(self.model_config, "mapping", None)
         if mapping is None or not mapping.has_cp_helix():
-            return new_draft_token
+            return None
 
-        num_contexts = attn_metadata.num_contexts
+        if last_tokens_idx is not None:
+            return last_tokens_idx[:attn_metadata.num_seqs]
+        return torch.cumsum(attn_metadata.seq_lens_cuda[:attn_metadata.num_seqs],
+                            dim=0,
+                            dtype=torch.long) - 1
+
+    def _draft_logits_for_sampling(self,
+                                   mtp_layer,
+                                   hidden_states,
+                                   lm_head,
+                                   attn_metadata,
+                                   gather_ids=None,
+                                   hidden_states_are_selected: bool = False):
+        if hidden_states_are_selected:
+            logits = mtp_layer.shared_head(hidden_states, lm_head,
+                                           attn_metadata, True)
+            return logits.float(), gather_ids, getattr(
+                mtp_layer.shared_head, "mapping_lm_head_tp", None)
+
+        if gather_ids is None:
+            gather_ids = self._helix_draft_gather_ids(attn_metadata, None)
+
+        if gather_ids is None:
+            logits = mtp_layer.shared_head(hidden_states, lm_head,
+                                           attn_metadata)
+        else:
+            logits = mtp_layer.shared_head(hidden_states[gather_ids], lm_head,
+                                           attn_metadata, True)
+        return logits.float(), gather_ids, getattr(
+            mtp_layer.shared_head, "mapping_lm_head_tp", None)
+
+    def _helix_select_cp_owner_values(self,
+                                      values,
+                                      gather_ids,
+                                      attn_metadata,
+                                      reduce_fn=None):
+        mapping = getattr(self.model_config, "mapping", None)
+        if (mapping is None or not mapping.has_cp_helix() or gather_ids is None
+                or not getattr(mapping, "enable_attention_dp", False)):
+            return values
+
+        if reduce_fn is None:
+            reduce_fn = cp_allreduce_sum
+
+        chunk_size = (attn_metadata.num_tokens + mapping.cp_size -
+                      1) // mapping.cp_size
+        local_start = mapping.cp_rank * chunk_size
+        local_offsets = gather_ids - local_start
+        is_local = (local_offsets >= 0) & (local_offsets < chunk_size)
+        return reduce_fn(values * is_local.to(values.dtype), mapping)
+
+
+class MTPWorker(HelixMTPWorkerMixin, SpecWorkerBase):
+
+    def __init__(self,
+                 spec_config: "MTPDecodingConfig",
+                 model_config=None,
+                 use_separate_draft_kv_cache: bool = False):
+        super().__init__(use_separate_draft_kv_cache)
+        self.spec_config = spec_config
+        self.model_config = model_config
+        self.is_thop = False
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if spec_config.sa_config is not None:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_config.threshold)
+
+    @property
+    def max_draft_len(self) -> int:
+        return self.spec_config.max_draft_len
+
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        super()._prepare_attn_metadata_for_spec_dec(attn_metadata)
+        # Save kv_lens_cuda values separately instead of routing through
+        # prepare_for_spec_dec, which would clone the tensor and break the
+        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
         batch_size = attn_metadata.num_seqs
-        num_gens = batch_size - num_contexts
-        if num_gens <= 0:
-            return new_draft_token
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                  batch_size].clone(
+                                                                  )
+        else:
+            self._saved_kv_lens_cuda = None
+        self._save_helix_attn_metadata_for_spec_dec(attn_metadata)
 
-        mtp_num_modules = self.spec_config.max_draft_len
-        positions = target_position_ids.reshape(-1)
-        gen_positions = positions[attn_metadata.num_ctx_tokens:].reshape(
-            num_gens, mtp_num_modules + 1)
-        first_gen_positions = gen_positions[:, 0].to(torch.int64)
-        accepted_lens = num_accepted_tokens[num_contexts:batch_size].to(
-            device=first_gen_positions.device, dtype=torch.int64)
-        draft_positions = first_gen_positions + accepted_lens + draft_step + 1
-
-        total_input_len = attn_metadata.helix_total_input_len[
-            num_contexts:batch_size].to(device=draft_positions.device,
-                                        dtype=torch.int64)
-        decode_index = draft_positions - total_input_len
-        owner_rank = torch.div(torch.clamp(decode_index, min=0),
-                               attn_metadata.tokens_per_block,
-                               rounding_mode='floor') % mapping.cp_size
-
-        local_gen_tokens = new_draft_token[num_contexts:batch_size].contiguous()
-        gathered_tokens = cp_allgather(local_gen_tokens, mapping, dim=0)
-        synced_tokens = _helix_sync_draft_token_from_gathered(
-            gathered_tokens, owner_rank, num_gens)
-        synced_draft_token = new_draft_token.clone()
-        synced_draft_token[num_contexts:batch_size].copy_(
-            synced_tokens.to(dtype=synced_draft_token.dtype))
-        return synced_draft_token
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
+        self._restore_helix_attn_metadata_from_spec_dec(attn_metadata)
 
     def forward(
         self,
@@ -749,41 +782,63 @@ class MTPWorker(SpecWorkerBase):
                     attn_metadata, "has_shared_dsa_topk_indices"):
                 attn_metadata.has_shared_dsa_topk_indices = False
             try:
+                self._helix_draft_owner_mask(attn_metadata,
+                                             draft_inputs["position_ids"],
+                                             attn_metadata.num_seqs)
                 for i, mtp_layer in enumerate(draft_model.mtp_layers):
+                    is_final_mtp_layer = i + 1 == len(draft_model.mtp_layers)
                     self._set_mtp_index_reuse(attn_metadata, i > 0)
+                    draft_gather_ids = self._helix_draft_gather_ids(
+                        attn_metadata, last_tokens_idx)
+                    gather_selected_hidden_states = (
+                        draft_gather_ids is not None
+                        and (not is_final_mtp_layer
+                             or self.guided_decoder is not None))
                     if self.guided_decoder is not None:
-                        new_tokens = draft_inputs['input_ids'][last_tokens_idx]
+                        draft_token_indices = (draft_gather_ids
+                                               if draft_gather_ids is not None
+                                               else last_tokens_idx)
+                        new_tokens = draft_inputs['input_ids'][
+                            draft_token_indices]
                         self.guided_decoder.add_draft_batch(new_tokens,
                                                             num_accepted_tokens,
                                                             draft_step=i)
 
-                    self._helix_draft_owner_mask(attn_metadata,
-                                                 draft_inputs["position_ids"],
-                                                 attn_metadata.num_seqs)
                     hidden_states = mtp_layer(
-                        embed_tokens=draft_model.embed_tokens, **draft_inputs)
+                        embed_tokens=draft_model.embed_tokens,
+                        helix_cp_gather_ids=draft_gather_ids,
+                        helix_cp_reduce_selected_rows=gather_selected_hidden_states,
+                        **draft_inputs)
 
-                    logits = mtp_layer.shared_head(hidden_states,
-                                                   draft_model.lm_head,
-                                                   attn_metadata).float()
+                    logits, draft_gather_ids, sampler_mapping = self._draft_logits_for_sampling(
+                        mtp_layer, hidden_states, draft_model.lm_head,
+                        attn_metadata, draft_gather_ids,
+                        draft_gather_ids is not None)
                     if self.guided_decoder is not None:
                         self.guided_decoder.execute_draft_batch(logits,
                                                                 draft_step=i)
 
+                    if sampler_mapping is None:
+                        sampler_mapping = draft_model.lm_head.mapping
                     new_draft_token = self.draft_sampler(
-                        logits, draft_model.lm_head.mapping)
-                    new_draft_token = self._helix_sync_new_draft_token(
-                        new_draft_token, position_ids, num_accepted_tokens,
-                        attn_metadata, i)
+                        logits, sampler_mapping)
+                    if (draft_gather_ids is not None
+                            and not gather_selected_hidden_states):
+                        new_draft_token = self._helix_select_cp_owner_values(
+                            new_draft_token, draft_gather_ids, attn_metadata)
                     next_draft_tokens.append(new_draft_token)
+                    if is_final_mtp_layer:
+                        continue
                     # shift input_ids and hidden_states
                     input_ids = draft_inputs["input_ids"]
                     input_ids[:-1] = input_ids[1:].clone()
                     input_ids[last_tokens_idx] = new_draft_token
                     draft_hidden_states = draft_inputs["hidden_states"]
                     draft_hidden_states[:-1] = draft_hidden_states[1:].clone()
-                    draft_hidden_states[last_tokens_idx] = hidden_states[
-                        last_tokens_idx, :]
+                    next_hidden_states = (hidden_states
+                                          if draft_gather_ids is not None else
+                                          hidden_states[last_tokens_idx, :])
+                    draft_hidden_states[last_tokens_idx] = next_hidden_states
                     draft_inputs = {
                         "input_ids": input_ids,
                         "position_ids": draft_inputs["position_ids"],

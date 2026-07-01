@@ -135,7 +135,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
 
     int64_t const tokens_per_block, int64_t const attention_window_size, int64_t const beam_width,
     int64_t const quant_mode, double const q_scaling, int64_t q_lora_rank, int64_t kv_lora_rank,
-    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append)
+    int64_t qk_nope_head_dim, int64_t qk_rope_head_dim, int64_t v_head_dim, bool rope_append,
+    bool helix_is_inactive_rank_per_token)
 {
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
@@ -168,8 +169,6 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         = helix_position_offsets.has_value() ? helix_position_offsets->data_ptr<int32_t>() : nullptr;
     bool const* helix_is_inactive_rank_ptr
         = helix_is_inactive_rank.has_value() ? helix_is_inactive_rank->data_ptr<bool>() : nullptr;
-    bool const helix_is_inactive_rank_per_token
-        = helix_is_inactive_rank.has_value() && helix_is_inactive_rank->numel() == num_tokens;
     int* cu_q_seqlens_ptr = reinterpret_cast<int*>(cu_q_seqlens.data_ptr());
     int* cu_kv_seqlens_ptr = reinterpret_cast<int*>(cu_kv_seqlens.data_ptr());
     uint32_t* fmha_tile_counter_ptr = reinterpret_cast<uint32_t*>(fmha_scheduler_counter.data_ptr());
@@ -307,6 +306,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", int qk_rope_head_dim"
         ", int v_head_dim"
         ", bool rope_append"
+        ", bool helix_is_inactive_rank_per_token"
         ") -> ()");
 }
 

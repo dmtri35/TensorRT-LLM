@@ -780,6 +780,7 @@ def trtllm_mha_with_cache(
         None,  # mrope_position_deltas
         None,  # helix_position_offsets
         None,  # helix_is_inactive_rank
+        False,  # helix_is_inactive_rank_per_token
         None,  # attention_chunk_size
         None,  # softmax_stats_tensor
         _GlobalTrtllmPlanner.is_spec_decoding_enabled,  # is_spec_decoding_enabled
