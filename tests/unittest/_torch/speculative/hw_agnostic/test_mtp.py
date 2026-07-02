@@ -9,7 +9,12 @@ from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.modules.attention import helix_cp_selective_reduce_rows
 from tensorrt_llm._torch.speculative.eagle3 import MTPEagleWorker
-from tensorrt_llm._torch.speculative.mtp import MTPHiddenStatesManager, MTPSpecMetadata, MTPWorker
+from tensorrt_llm._torch.speculative.mtp import (
+    MTPHiddenStatesManager,
+    MTPSpecMetadata,
+    MTPWorker,
+    _helix_sync_draft_token_from_gathered,
+)
 from tensorrt_llm.llmapi import MTPDecodingConfig
 
 
@@ -294,6 +299,17 @@ class TestMTPSampleAndAcceptDraftTokens(unittest.TestCase):
         torch.testing.assert_close(returned_gather_ids, gather_ids)
         self.assertTrue(calls[0][1])
         self.assertIsNone(sampler_mapping)
+
+    def test_helix_sync_draft_token_uses_owner_rank_rows(self):
+        gathered_tokens = torch.tensor([10, 11, 12, 20, 21, 22, 30, 31, 32],
+                                       dtype=torch.int32)
+        owner_rank = torch.tensor([2, 0, 1], dtype=torch.long)
+
+        synced_tokens = _helix_sync_draft_token_from_gathered(
+            gathered_tokens, owner_rank, num_gens=3)
+
+        torch.testing.assert_close(
+            synced_tokens, torch.tensor([30, 11, 22], dtype=torch.int32))
 
     def test_mtp_eagle_forwards_helix_selected_rows_to_mtp_layer(self):
         mapping = SimpleNamespace(has_cp_helix=lambda: True)

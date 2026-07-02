@@ -862,6 +862,12 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                 else:
                     gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
+                helix_gather_ids = None
+                gather_selected_hidden_states = False
+                if self.is_mtp_eagle and self._has_helix_cp():
+                    helix_gather_ids = gather_ids
+                    gather_selected_hidden_states = True
+
                 if self.guided_decoder is not None:
                     new_tokens = inputs["input_ids"][gather_ids]
                     self.guided_decoder.add_draft_batch(new_tokens,
@@ -876,7 +882,9 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                     draft_model,
                     inputs,
                     spec_metadata,
-                    i)
+                    i,
+                    helix_cp_gather_ids=helix_gather_ids,
+                    helix_cp_reduce_selected_rows=gather_selected_hidden_states)
 
                 # Compute logits.
                 # MTP Eagle: shared_head of the MTP layer, with optional
@@ -890,7 +898,9 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                                 'enable_lm_head_tp_in_adp', False))
                 if self.is_mtp_eagle:
                     if use_lm_head_tp_in_adp:
-                        hidden_states_gathered = hidden_states[gather_ids]
+                        hidden_states_gathered = (
+                            hidden_states if gather_selected_hidden_states else
+                            hidden_states[gather_ids])
                         token_count = hidden_states_gathered.view(
                             -1, hidden_states_gathered.shape[-1]).shape[0]
                         max_num_requests = spec_metadata.max_num_requests
@@ -914,8 +924,11 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                             padded_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
                     else:
+                        logits_hidden_states = (
+                            hidden_states if gather_selected_hidden_states else
+                            hidden_states[gather_ids])
                         logits = draft_model.mtp_layers[0].shared_head(
-                            hidden_states[gather_ids], draft_model.lm_head,
+                            logits_hidden_states, draft_model.lm_head,
                             attn_metadata, True)
                 else:
                     logits = draft_model.logits_processor(
@@ -955,7 +968,9 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                 # Eagle3: the EAGLE draft model returns a secondary
                 #   ``hidden_states_to_save`` specifically for this purpose.
                 if self.is_mtp_eagle:
-                    hidden_states = hidden_states[gather_ids]
+                    hidden_states = (hidden_states
+                                     if gather_selected_hidden_states else
+                                     hidden_states[gather_ids])
                 else:
                     hidden_states = hidden_states_to_save[gather_ids]
                 position_ids = (_select_mtp_position_ids(
@@ -1083,8 +1098,13 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
         return (spec_metadata.all_rank_num_tokens
                 if step_idx == 0 else spec_metadata.subseq_all_rank_num_tokens)
 
-    def _run_draft_forward(self, draft_model, inputs, spec_metadata,
-                           step_idx: int):
+    def _run_draft_forward(self,
+                           draft_model,
+                           inputs,
+                           spec_metadata,
+                           step_idx: int,
+                           helix_cp_gather_ids=None,
+                           helix_cp_reduce_selected_rows: bool = True):
         """Invoke the draft model for one iteration, branching on mode.
 
         ``all_rank_num_tokens`` is passed as a kwarg in both modes. For MTP
@@ -1099,6 +1119,8 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
             hidden_states = draft_model.mtp_layers[0](
                 embed_tokens=draft_model.embed_tokens,
                 all_rank_num_tokens=all_rank_num_tokens,
+                helix_cp_gather_ids=helix_cp_gather_ids,
+                helix_cp_reduce_selected_rows=helix_cp_reduce_selected_rows,
                 **inputs)
             return hidden_states, None
 
