@@ -2910,7 +2910,8 @@ class PyTorchModelEngine(ModelEngine):
             self.num_accepted_draft_tokens_cuda[idx_accepted_tokens] + 1)
 
         self.num_accepted_draft_tokens_cuda[:num_extend_reqeust_wo_dummy].copy_(
-            num_accepted_tokens_device[:num_extend_reqeust_wo_dummy],
+            num_accepted_tokens_device[
+                previous_slots[:num_extend_reqeust_wo_dummy]],
             non_blocking=True)
 
         # Initialize offset tensors to zeros

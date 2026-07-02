@@ -28,7 +28,6 @@ else:
 SampleStateMTP = SampleStateSpec
 
 
-@torch.compile(options={"max-autotune": True})
 def _helix_draft_owner_batch_tensor(positions, total_input_len,
                                     tokens_per_block: int, cp_size: int,
                                     cp_rank: int):
@@ -38,7 +37,6 @@ def _helix_draft_owner_batch_tensor(positions, total_input_len,
         ((decode_index // tokens_per_block) % cp_size) == cp_rank)
 
 
-@torch.compile(options={"max-autotune": True})
 def _helix_draft_owner_rows_tensor(positions, seq_lens, total_input_lens,
                                    batch_size: int, num_tokens: int,
                                    tokens_per_block: int, cp_size: int,
@@ -61,7 +59,6 @@ def _helix_draft_owner_rows_tensor(positions, seq_lens, total_input_lens,
     return owner_counts, ~owner
 
 
-@torch.compile(options={"max-autotune": True})
 def _helix_accepted_owner_counts_tensor(seq_lens, inactive_rank,
                                         num_accepted_tokens,
                                         batch_size: int, num_tokens: int):
@@ -86,7 +83,6 @@ def _helix_accepted_owner_counts_tensor(seq_lens, inactive_rank,
     return accepted_owner_counts
 
 
-@torch.compile(options={"max-autotune": True})
 def _helix_first_draft_kv_lens_delta_tensor(saved_inactive, saved_positions,
                                             seq_lens, total_input_lens,
                                             num_accepted_tokens,
@@ -132,7 +128,6 @@ def _helix_first_draft_kv_lens_delta_tensor(saved_inactive, saved_positions,
     return desired_owned_counts - old_owned_counts
 
 
-@torch.compile(options={"max-autotune": True})
 def _helix_rejected_owned_tensor(inactive_rank, num_accepted_tokens,
                                  num_contexts: int, batch_size: int,
                                  num_ctx_tokens: int, mtp_num_modules: int):
@@ -146,6 +141,15 @@ def _helix_rejected_owned_tensor(inactive_rank, num_accepted_tokens,
     rejected = token_indices >= num_accepted_tokens[
         num_contexts:batch_size].unsqueeze(1)
     return ((~gen_flags) & rejected).sum(dim=1)
+
+
+def _helix_sync_draft_token_from_gathered(gathered_tokens, owner_rank,
+                                          num_gens: int):
+    gen_indices = torch.arange(num_gens,
+                               dtype=torch.long,
+                               device=gathered_tokens.device)
+    gathered_indices = owner_rank.to(torch.long) * num_gens + gen_indices
+    return gathered_tokens[gathered_indices]
 
 
 def _normalize_mtp_position_ids(position_ids: torch.Tensor) -> torch.Tensor:

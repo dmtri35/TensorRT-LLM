@@ -326,6 +326,54 @@ class PyTorchModelEngineTestCase(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def test_update_target_input_tensors_reads_accepted_counts_by_seq_slot(
+            self) -> None:
+        model_engine = PyTorchModelEngine.__new__(PyTorchModelEngine)
+
+        total_num_tokens = 8
+        num_requests = 2
+        num_tokens_per_request = 4
+        previous_slots = torch.tensor([3, 1], dtype=torch.long)
+
+        model_engine.idx_accepted_tokens_cache = torch.tensor(
+            [0, 0, 0, 0, 1, 1, 1, 1], dtype=torch.long)
+        model_engine.num_accepted_draft_tokens_cuda = torch.zeros(
+            num_requests, dtype=torch.int32)
+        model_engine.position_ids_cuda = torch.zeros(total_num_tokens,
+                                                     dtype=torch.int32)
+        model_engine.previous_pos_id_offsets_cuda = torch.zeros(
+            total_num_tokens, dtype=torch.int32)
+        model_engine.previous_kv_lens_offsets_cuda = torch.zeros(num_requests,
+                                                                 dtype=torch.int32)
+        model_engine.previous_pos_indices_cuda = torch.empty(total_num_tokens,
+                                                             dtype=torch.long)
+        model_engine.input_ids_cuda = torch.empty(total_num_tokens,
+                                                  dtype=torch.int32)
+        model_engine.draft_tokens_cuda = torch.empty(6, dtype=torch.int32)
+
+        num_accepted_tokens_device = torch.tensor([99, 5, 88, 2],
+                                                  dtype=torch.int32)
+        new_tokens_device = torch.arange(16, dtype=torch.int32).reshape(4, 4)
+        next_draft_tokens_device = torch.arange(12,
+                                                dtype=torch.int32).reshape(4, 3)
+        new_tokens_lens_device = torch.tensor([10, 20, 30, 40],
+                                              dtype=torch.int32)
+
+        model_engine._update_target_input_tensors(
+            num_accepted_tokens_device=num_accepted_tokens_device,
+            new_tokens_device=new_tokens_device,
+            next_draft_tokens_device=next_draft_tokens_device,
+            new_tokens_lens_device=new_tokens_lens_device,
+            previous_slots=previous_slots,
+            total_num_tokens=total_num_tokens,
+            num_extend_reqeust_wo_dummy=num_requests,
+            num_tokens_per_extend_request=num_tokens_per_request,
+            previous_batch_draft_tokens=6)
+
+        torch.testing.assert_close(
+            model_engine.num_accepted_draft_tokens_cuda,
+            torch.tensor([2, 5], dtype=torch.int32))
+
     def test_warmup(self):
         model_engine, kv_cache_manager = create_model_engine_and_kvcache()
         resource_manager = ResourceManager(

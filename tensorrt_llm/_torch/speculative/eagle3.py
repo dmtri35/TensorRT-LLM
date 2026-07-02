@@ -10,7 +10,7 @@ from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..distributed.ops import allgather
+from ..distributed.ops import allgather, cp_allgather
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.mamba_cache_manager import MambaHybridCacheManager
@@ -19,7 +19,9 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import (HelixMTPWorkerMixin, MTPSampler,
-                  _helix_rejected_owned_tensor, _select_mtp_position_ids)
+                  _helix_rejected_owned_tensor,
+                  _helix_sync_draft_token_from_gathered,
+                  _select_mtp_position_ids)
 from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
@@ -660,6 +662,49 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                 self._saved_generation_lengths)
             self._saved_generation_lengths = None
 
+    def _helix_draft_owner_rank(self, position_ids, attn_metadata,
+                                num_contexts: int, batch_size: int):
+        mapping = getattr(self.model_config, "mapping", None)
+        if mapping is None or not mapping.has_cp_helix():
+            return None
+
+        num_gens = batch_size - num_contexts
+        if num_gens <= 0:
+            return None
+
+        positions = position_ids.reshape(-1)
+        if positions.numel() != batch_size:
+            return None
+
+        gen_positions = positions[num_contexts:batch_size].to(torch.int64)
+        total_input_len = attn_metadata.helix_total_input_len[
+            num_contexts:batch_size].to(device=gen_positions.device,
+                                        dtype=torch.int64)
+        decode_index = gen_positions - total_input_len
+        return torch.div(torch.clamp(decode_index, min=0),
+                         attn_metadata.tokens_per_block,
+                         rounding_mode='floor') % mapping.cp_size
+
+    def _helix_sync_new_draft_token(self, new_draft_token, draft_position_ids,
+                                    attn_metadata, num_contexts: int,
+                                    batch_size: int):
+        mapping = getattr(self.model_config, "mapping", None)
+        owner_rank = self._helix_draft_owner_rank(draft_position_ids,
+                                                 attn_metadata, num_contexts,
+                                                 batch_size)
+        if owner_rank is None:
+            return new_draft_token
+
+        num_gens = batch_size - num_contexts
+        local_gen_tokens = new_draft_token[num_contexts:batch_size].contiguous()
+        gathered_tokens = cp_allgather(local_gen_tokens, mapping, dim=0)
+        synced_tokens = _helix_sync_draft_token_from_gathered(
+            gathered_tokens, owner_rank, num_gens)
+        synced_draft_token = new_draft_token.clone()
+        synced_draft_token[num_contexts:batch_size].copy_(
+            synced_tokens.to(dtype=synced_draft_token.dtype))
+        return synced_draft_token
+
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
 
@@ -795,6 +840,11 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
 
         with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
             for i in range(runtime_draft_len):
+                helix_owner_counts = None
+                if self.is_mtp_eagle:
+                    helix_owner_counts = self._helix_draft_owner_mask(
+                        attn_metadata, inputs["position_ids"], batch_size)
+
                 # Compute gather_ids: on the first draft step each generation
                 # request may have accepted multiple tokens, so we index into
                 # the flattened token sequence to find the last accepted one.
@@ -812,15 +862,6 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                 else:
                     gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
-                helix_gather_ids = None
-                helix_owner_counts = None
-                gather_selected_hidden_states = False
-                if self.is_mtp_eagle and self._has_helix_cp():
-                    helix_gather_ids = gather_ids
-                    gather_selected_hidden_states = True
-                    helix_owner_counts = self._helix_draft_owner_mask(
-                        attn_metadata, inputs["position_ids"], batch_size)
-
                 if self.guided_decoder is not None:
                     new_tokens = inputs["input_ids"][gather_ids]
                     self.guided_decoder.add_draft_batch(new_tokens,
@@ -835,9 +876,7 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                     draft_model,
                     inputs,
                     spec_metadata,
-                    i,
-                    helix_cp_gather_ids=helix_gather_ids,
-                    helix_cp_reduce_selected_rows=gather_selected_hidden_states)
+                    i)
 
                 # Compute logits.
                 # MTP Eagle: shared_head of the MTP layer, with optional
@@ -850,15 +889,7 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                     and getattr(self.model_config.mapping,
                                 'enable_lm_head_tp_in_adp', False))
                 if self.is_mtp_eagle:
-                    if helix_gather_ids is not None:
-                        logits, _, _ = self._draft_logits_for_sampling(
-                            draft_model.mtp_layers[0],
-                            hidden_states,
-                            draft_model.lm_head,
-                            attn_metadata,
-                            helix_gather_ids,
-                            hidden_states_are_selected=True)
-                    elif use_lm_head_tp_in_adp:
+                    if use_lm_head_tp_in_adp:
                         hidden_states_gathered = hidden_states[gather_ids]
                         token_count = hidden_states_gathered.view(
                             -1, hidden_states_gathered.shape[-1]).shape[0]
@@ -910,14 +941,13 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                 # would otherwise fail to broadcast in apply_temperature. This
                 # also keeps next_draft_tokens and the draft_probs buffer
                 # token_count-sized without a post-hoc trim.
-                if use_lm_head_tp_in_adp and helix_gather_ids is None:
+                if use_lm_head_tp_in_adp:
                     logits = logits[:token_count]
                 new_draft_token = self.draft_decoder(logits,
                                                      draft_model,
                                                      spec_metadata,
                                                      batch_size,
                                                      draft_step=i)
-                next_draft_tokens.append(new_draft_token)
 
                 # Update hidden states for the next iteration.
                 # MTP Eagle: the MTP layer returns a single tensor; slice by
@@ -925,13 +955,15 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
                 # Eagle3: the EAGLE draft model returns a secondary
                 #   ``hidden_states_to_save`` specifically for this purpose.
                 if self.is_mtp_eagle:
-                    hidden_states = (hidden_states
-                                     if helix_gather_ids is not None else
-                                     hidden_states[gather_ids])
+                    hidden_states = hidden_states[gather_ids]
                 else:
                     hidden_states = hidden_states_to_save[gather_ids]
                 position_ids = (_select_mtp_position_ids(
                     inputs["position_ids"], gather_ids) + 1)
+                new_draft_token = self._helix_sync_new_draft_token(
+                    new_draft_token, position_ids, attn_metadata, num_contexts,
+                    batch_size)
+                next_draft_tokens.append(new_draft_token)
 
                 # Update attn_metadata for the next iteration.
                 if i == 0:
@@ -1051,13 +1083,8 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
         return (spec_metadata.all_rank_num_tokens
                 if step_idx == 0 else spec_metadata.subseq_all_rank_num_tokens)
 
-    def _run_draft_forward(self,
-                           draft_model,
-                           inputs,
-                           spec_metadata,
-                           step_idx: int,
-                           helix_cp_gather_ids=None,
-                           helix_cp_reduce_selected_rows: bool = True):
+    def _run_draft_forward(self, draft_model, inputs, spec_metadata,
+                           step_idx: int):
         """Invoke the draft model for one iteration, branching on mode.
 
         ``all_rank_num_tokens`` is passed as a kwarg in both modes. For MTP
@@ -1072,8 +1099,6 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
             hidden_states = draft_model.mtp_layers[0](
                 embed_tokens=draft_model.embed_tokens,
                 all_rank_num_tokens=all_rank_num_tokens,
-                helix_cp_gather_ids=helix_cp_gather_ids,
-                helix_cp_reduce_selected_rows=helix_cp_reduce_selected_rows,
                 **inputs)
             return hidden_states, None
 
@@ -1132,25 +1157,27 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
         Falls back to simple argmax when no tensor parallelism is active or
         when only attention DP is enabled without LM-head TP.
         """
-        if (self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
-            combined = self._get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            return self._get_draft_tokens_from_gathered(gathered)
-        elif (self.model_config is not None
-              and hasattr(self.model_config, 'mapping')
-              and self.model_config.mapping.tp_size > 1
-              and self.model_config.mapping.enable_lm_head_tp_in_adp):
+        sampler_mapping = mapping_lm_head_tp
+        if (sampler_mapping is None and self.model_config is not None
+                and hasattr(self.model_config, 'mapping')):
+            sampler_mapping = self.model_config.mapping
+
+        if (sampler_mapping is not None and sampler_mapping.tp_size > 1
+                and not sampler_mapping.enable_attention_dp):
             combined = self._get_local_max_and_combined(logits,
-                                                        mapping_lm_head_tp)
-            gathered = allgather(combined, mapping_lm_head_tp, dim=-1)
+                                                        sampler_mapping)
+            gathered = allgather(combined, sampler_mapping, dim=-1)
+            return self._get_draft_tokens_from_gathered(gathered)
+        elif (sampler_mapping is not None and sampler_mapping.tp_size > 1
+              and sampler_mapping.enable_lm_head_tp_in_adp):
+            combined = self._get_local_max_and_combined(logits,
+                                                        sampler_mapping)
+            gathered = allgather(combined, sampler_mapping, dim=-1)
             batch_size = logits.shape[0]
-            local_batch_size = batch_size // mapping_lm_head_tp.tp_size
-            gathered = gathered.view(mapping_lm_head_tp.tp_size,
+            local_batch_size = batch_size // sampler_mapping.tp_size
+            gathered = gathered.view(sampler_mapping.tp_size,
                                      local_batch_size, -1)
-            sliced_gathered = gathered[mapping_lm_head_tp.tp_rank]
+            sliced_gathered = gathered[sampler_mapping.tp_rank]
             return self._get_draft_tokens_from_gathered(sliced_gathered)
         else:
             return self._draft_sampler_greedy(logits)
@@ -1298,6 +1325,8 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
         # MTP-Eagle + TP). draft_sampler() all-gathers the sharded logits
         # before argmax (and falls back to a plain argmax when no TP gather is
         # needed). Eagle3 (non-MTP) keeps its d2t-aware argmax.
+        lm_head_mapping = getattr(getattr(draft_model, 'lm_head', None),
+                                  'mapping', None)
         if spec_metadata.is_all_greedy_sample:
             # Only plain tensor parallelism (tp_size>1 without attention DP)
             # shards the draft logits over the vocab dim and thus needs
@@ -1307,11 +1336,8 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
             # d2t-aware argmax. (Routing ADP/LM-head-TP through draft_sampler
             # without its mapping_lm_head_tp arg hits the None-mapping branch
             # and crashes with 'NoneType has no attribute tp_group'.)
-            if (self.is_mtp_eagle and self.model_config is not None
-                    and hasattr(self.model_config, 'mapping')
-                    and self.model_config.mapping.tp_size > 1
-                    and not self.model_config.mapping.enable_attention_dp):
-                return self.draft_sampler(logits)
+            if self.is_mtp_eagle:
+                return self.draft_sampler(logits, lm_head_mapping)
             return self._draft_sampler_greedy(logits, d2t)
         # Non-greedy (advanced) draft sampling has the same TP hazard as the
         # greedy path: when the draft LM head is plain tensor-parallel
@@ -1323,11 +1349,10 @@ class Eagle3OneModelWorker(HelixMTPWorkerMixin, SpecWorkerBase):
         # shared seed. (Greedy uses draft_sampler()'s lighter max+index gather;
         # random sampling needs the full distribution. The LM-head-TP-in-ADP
         # case is handled upstream and must not be gathered again here.)
-        if (self.is_mtp_eagle and self.model_config is not None
-                and hasattr(self.model_config, 'mapping')
-                and self.model_config.mapping.tp_size > 1
-                and not self.model_config.mapping.enable_attention_dp):
-            logits = allgather(logits, self.model_config.mapping, dim=-1)
+        if (self.is_mtp_eagle and lm_head_mapping is not None
+                and lm_head_mapping.tp_size > 1
+                and not lm_head_mapping.enable_attention_dp):
+            logits = allgather(logits, lm_head_mapping, dim=-1)
         if spec_metadata.use_rejection_sampling and draft_step is not None:
             return self._draft_sampler_advanced_for_rejection(
                 logits, spec_metadata, batch_size, d2t, draft_step)
